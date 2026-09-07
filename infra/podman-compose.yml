@@ -144,6 +144,10 @@ services:
     container_name: iris-worker
     # Target topology only — see the header. Locally: `npm run dev:worker`.
     profiles: ["vps"]
+    # The compose default is already 10s; stated explicitly because
+    # AI_WORKER_DRAIN_MS is sized against it. Raising the drain above this
+    # value would mean the worker is killed rather than exiting cleanly.
+    stop_grace_period: 10s
     depends_on:
       iris-redis:
         condition: service_healthy
@@ -171,6 +175,9 @@ services:
       # Bound every outbound call: a hung request must not hold a worker slot.
       CORE_TIMEOUT_MS: 5000
       AI_TIMEOUT_MS: 10000
+      # SIGTERM drain deadline. MUST stay below stop_grace_period below, or the
+      # runtime SIGKILLs the worker before it can close Redis and exit.
+      AI_WORKER_DRAIN_MS: 8000
       # ───────────────────────────────────────────────────────────────────
       # NO DATABASE URL. The worker reads and writes only through
       # core-service/internal/*. See /SKILLS.md invariant 1.

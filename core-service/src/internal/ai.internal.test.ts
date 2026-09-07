@@ -555,3 +555,213 @@ describe('auditability', () => {
     expect(after).toContain('stub-noop');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 3 Step 4 — terminal failure reporting.
+//
+// Core needed NO production change for Step 4: the failed branch of
+// submitAIResult already existed. These are therefore REGRESSION tests that
+// pin the behaviour Step 4 now depends on, so a future refactor of the result
+// path cannot silently break terminal reporting.
+// ─────────────────────────────────────────────────────────────────────────
+
+const terminalResult = (over: Record<string, unknown> = {}) => ({
+  feature: 'noop',
+  status: 'failed',
+  data: {},
+  error: {
+    kind: 'temporary',
+    code: 'retries_exhausted',
+    message: '6 attempts exhausted: ai_service_unreachable',
+  },
+  ...over,
+});
+
+describe('terminal failure reporting (Step 4)', () => {
+  it('closes a running execution as failed with retries_exhausted', async () => {
+    const t = await createTicket(PRODUCT_A);
+    const c = claims(t, { attempt: 6 });
+    await postInput(t.eventId, c);
+
+    const res = await postResult(t.eventId, { ...c, result: terminalResult() });
+    expect(res.statusCode, res.body).toBe(200);
+
+    const body = res.json();
+    expect(body.status).toBe('failed');
+    expect(body.applied).toBe(true);
+    expect(body.ticket_updated).toBe(false);
+
+    const row = await readExecution(t.eventId);
+    expect(row.status).toBe('failed');
+    expect(row.error_code).toBe('retries_exhausted');
+    expect(row.error_message).toContain('attempts exhausted');
+    expect(row.completed_at, 'terminal executions must be stamped').not.toBeNull();
+    expect(row.result, 'a failure carries no validated result').toBeNull();
+    expect(await countAudit(t.ticketId)).toBe(1);
+  });
+
+  it('records a permanent worker failure with its own error code', async () => {
+    const t = await createTicket(PRODUCT_A);
+    const c = claims(t);
+    await postInput(t.eventId, c);
+
+    await postResult(t.eventId, {
+      ...c,
+      result: terminalResult({
+        error: {
+          kind: 'permanent',
+          code: 'malformed_ai_response',
+          message: 'permanent failure: malformed_ai_response',
+        },
+      }),
+    });
+
+    const row = await readExecution(t.eventId);
+    expect(row.status).toBe('failed');
+    expect(row.error_code).toBe('malformed_ai_response');
+  });
+
+  it('does not run the feature validator on a failed result', async () => {
+    // `data: {}` would fail the noop validator. Core must not apply it when
+    // the worker has already declared failure, or every terminal report would
+    // be rewritten as invalid_ai_output.
+    const t = await createTicket(PRODUCT_A);
+    const c = claims(t);
+    await postInput(t.eventId, c);
+    await postResult(t.eventId, { ...c, result: terminalResult() });
+
+    const row = await readExecution(t.eventId);
+    expect(row.error_code).toBe('retries_exhausted');
+    expect(row.error_code).not.toBe('invalid_ai_output');
+  });
+
+  it('a duplicate terminal report changes nothing', async () => {
+    const t = await createTicket(PRODUCT_A);
+    const c = claims(t);
+    await postInput(t.eventId, c);
+
+    const first = await postResult(t.eventId, { ...c, result: terminalResult() });
+    expect(first.json().applied).toBe(true);
+
+    const second = await postResult(t.eventId, {
+      ...claims(t),
+      result: terminalResult({
+        error: { kind: 'temporary', code: 'something_else', message: 'different' },
+      }),
+    });
+
+    expect(second.statusCode).toBe(200);
+    expect(second.json().applied).toBe(false);
+    expect(second.json().status).toBe('failed');
+
+    const row = await readExecution(t.eventId);
+    expect(row.error_code, 'the first report stands').toBe('retries_exhausted');
+    expect(await countAudit(t.ticketId), 'no second audit row').toBe(1);
+  });
+
+  it('concurrent terminal reports produce exactly one transition', async () => {
+    const t = await createTicket(PRODUCT_A);
+    const c = claims(t);
+    await postInput(t.eventId, c);
+
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        postResult(t.eventId, { ...claims(t), result: terminalResult() }),
+      ),
+    );
+
+    const applied = responses.filter((r) => r.json().applied === true);
+    expect(applied, 'the row lock must serialise them').toHaveLength(1);
+    expect(await countAudit(t.ticketId)).toBe(1);
+  });
+
+  it('a terminal report CANNOT overwrite a success', async () => {
+    const t = await createTicket(PRODUCT_A);
+    const c = claims(t);
+    await postInput(t.eventId, c);
+    await postResult(t.eventId, { ...c, result: noopResult() });
+
+    const late = await postResult(t.eventId, { ...claims(t), result: terminalResult() });
+
+    expect(late.json().applied).toBe(false);
+    expect(late.json().status).toBe('succeeded');
+
+    const row = await readExecution(t.eventId);
+    expect(row.status, 'terminal states never resurrect').toBe('succeeded');
+    expect(row.error_code).toBeNull();
+    expect(await countAudit(t.ticketId)).toBe(1);
+  });
+
+  it('a late success CANNOT overwrite a terminal failure', async () => {
+    const t = await createTicket(PRODUCT_A);
+    const c = claims(t);
+    await postInput(t.eventId, c);
+    await postResult(t.eventId, { ...c, result: terminalResult() });
+
+    const lateSuccess = await postResult(t.eventId, { ...claims(t), result: noopResult() });
+
+    expect(lateSuccess.json().applied).toBe(false);
+    // The worker can tell this apart from a routine duplicate — the returned
+    // status is `failed`, not `succeeded` — and logs it as an anomaly.
+    expect(lateSuccess.json().status).toBe('failed');
+
+    const row = await readExecution(t.eventId);
+    expect(row.status).toBe('failed');
+    expect(row.result, 'the discarded success must not be persisted').toBeNull();
+    expect(await countAudit(t.ticketId)).toBe(1);
+  });
+
+  it('404s a terminal report for an execution that was never claimed', async () => {
+    // Every attempt died before /input ever claimed a row. Nothing to close,
+    // and nothing is stuck — the worker treats this as terminal-complete.
+    const t = await createTicket(PRODUCT_A);
+    const res = await postResult(t.eventId, { ...claims(t), result: terminalResult() });
+
+    expect(res.statusCode).toBe(404);
+    expect(await readExecution(t.eventId)).toBeNull();
+    expect(await countAudit(t.ticketId)).toBe(0);
+  });
+
+  it('the audit row records the failure cause but no error message', async () => {
+    const t = await createTicket(PRODUCT_A);
+    const c = claims(t);
+    await postInput(t.eventId, c);
+    await postResult(t.eventId, { ...c, result: terminalResult() });
+
+    const after = await withSystemScope('test', async (tx) => {
+      const { rows } = await tx.query<{ action: string; actor_type: string; after: unknown }>(
+        `SELECT action, actor_type, after FROM audit_event
+          WHERE entity_id = $1 AND action LIKE 'ai.%'`,
+        [t.ticketId],
+      );
+      return rows[0]!;
+    });
+
+    expect(after.action).toBe('ai.execution_failed');
+    expect(after.actor_type).toBe('system');
+
+    const blob = JSON.stringify(after.after);
+    expect(blob).toContain('retries_exhausted');
+    expect(blob).toContain('noop');
+    // error_message stays in ai_execution only; the audit carries the code.
+    expect(blob).not.toContain('attempts exhausted');
+  });
+
+  it('leaves the ticket completely untouched', async () => {
+    const t = await createTicket(PRODUCT_A);
+    const before = await withSystemScope('test', async (tx) => {
+      const { rows } = await tx.query(`SELECT * FROM ticket WHERE id = $1`, [t.ticketId]);
+      return rows[0];
+    });
+
+    const c = claims(t);
+    await postInput(t.eventId, c);
+    await postResult(t.eventId, { ...c, result: terminalResult() });
+
+    const after = await withSystemScope('test', async (tx) => {
+      const { rows } = await tx.query(`SELECT * FROM ticket WHERE id = $1`, [t.ticketId]);
+      return rows[0];
+    });
+    expect(after).toEqual(before);
+  });
+});

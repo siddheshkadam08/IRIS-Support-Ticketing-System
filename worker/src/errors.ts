@@ -56,6 +56,30 @@ export class TemporaryJobError extends Error {
 const RETRYABLE_4XX = new Set([408, 429]);
 
 /**
+ * Is this error an aborted/timed-out request rather than a real answer?
+ *
+ * ⚠️ THIS IS NOT DEFENSIVE PROGRAMMING. `fetch` resolves as soon as the
+ * response HEADERS arrive, so an `AbortSignal.timeout` can still fire while
+ * the BODY is being read — and it surfaces there as a rejection from
+ * `res.json()`, in the same place a genuinely malformed payload does.
+ *
+ * `[LIVE]` verified against a server that sends `200` plus a partial body and
+ * then stalls: `fetch` resolved in 85ms, and `res.json()` rejected 1526ms
+ * later with `name: 'TimeoutError'` — NOT a SyntaxError, and with no `cause`.
+ *
+ * Without this check that rejection was classified `malformed_ai_response`,
+ * which is permanent, so a merely slow AI service dead-lettered its job on the
+ * first attempt instead of being retried. A timeout is a failure signal, never
+ * a statement that the request was wrong.
+ */
+export function isAbortError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const name = (err as { name?: unknown }).name;
+  // TimeoutError: AbortSignal.timeout fired. AbortError: aborted explicitly.
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
+/**
  * Map an HTTP status onto the retry decision. THE single classifier — both the
  * Core client and the AI client route through it so they cannot diverge.
  *

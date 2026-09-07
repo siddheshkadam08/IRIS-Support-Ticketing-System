@@ -19,11 +19,16 @@
 /**
  * Total executions of a job, first attempt included.
  *
- * 5 attempts => BullMQ calls the backoff strategy 4 times. Its retry test is
- * `attemptsMade + 1 < attempts`, so the 5th execution is terminal and no delay
+ * 6 attempts => BullMQ calls the backoff strategy 5 times, which is exactly the
+ * number of entries in AI_RETRY_DELAYS_SECONDS. Its retry test is
+ * `attemptsMade + 1 < attempts`, so the 6th execution is terminal and no delay
  * follows it. Verified against the installed bullmq 5.81.4 source, not assumed.
+ *
+ * This was 5 in the first cut of Step 3, which made the 600s tail unreachable
+ * and capped the retry window at 151s. Six is the count the platform curve was
+ * always sized for: n delays require n+1 attempts.
  */
-export const AI_RETRY_ATTEMPTS = 5;
+export const AI_RETRY_ATTEMPTS = 6;
 
 /**
  * The retry curve, in seconds, indexed by the attempt that just failed.
@@ -33,20 +38,22 @@ export const AI_RETRY_ATTEMPTS = 5;
  * rather than two. It is fast at the head (1s absorbs a momentary blip) and
  * long in the tail (a provider incident gets minutes, not milliseconds).
  *
- * ⚠️ AT 5 ATTEMPTS ONLY THE FIRST FOUR ENTRIES ARE REACHABLE.
+ * ALL FIVE ENTRIES ARE REACHABLE AT 6 ATTEMPTS.
  *
  *   execution 1 fails -> strategy(1) -> 1s
  *   execution 2 fails -> strategy(2) -> 5s
  *   execution 3 fails -> strategy(3) -> 25s
  *   execution 4 fails -> strategy(4) -> 120s
- *   execution 5 fails -> TERMINAL, no delay
+ *   execution 5 fails -> strategy(5) -> 600s
+ *   execution 6 fails -> TERMINAL, no delay
  *
- *   effective retry window = 1 + 5 + 25 + 120 = 151s (~2.5 min)
+ *   retry window = 1 + 5 + 25 + 120 + 600 = 751s (~12.5 min)
  *
- * The 600s entry is retained, unreachable, so that raising AI_RETRY_ATTEMPTS to
- * 6 extends the window to ~12.5 minutes as a one-constant change. Raising it is
- * a deliberate decision, NOT a default: it also raises the maximum job lifetime,
- * which the Phase 3 reaper threshold is derived from.
+ * ⚠️ PHASE 3 STEP 5 DEPENDENCY. Maximum job lifetime is derived from this
+ * window, and the abandoned-execution reaper derives its stale threshold from
+ * that lifetime. The Step 2 draft threshold of 45 minutes was computed against
+ * the 151s window and is therefore STALE — Step 5 must recompute it from the
+ * 751s window, not inherit the old number.
  */
 export const AI_RETRY_DELAYS_SECONDS: readonly number[] = [1, 5, 25, 120, 600];
 
@@ -101,7 +108,7 @@ export function aiRetryDelayMs(attemptsMade: number, random: () => number = Math
 export function aiRetryWindowMs(attempts: number = AI_RETRY_ATTEMPTS): number {
   let total = 0;
   // attempts - 1 delays: the final execution is terminal and is not followed
-  // by a wait.
+  // by a wait. n delays therefore require n + 1 attempts to all be reachable.
   for (let a = 1; a <= attempts - 1; a++) {
     const index = Math.min(a - 1, AI_RETRY_DELAYS_SECONDS.length - 1);
     total += AI_RETRY_DELAYS_SECONDS[index]! * 1000;

@@ -48,6 +48,26 @@ const Env = z.object({
   AI_SERVICE_HMAC_SECRET: z.string().min(16).default('dev_ai_service_hmac_secret_change_me'),
   /** Inference is slower than Core, but still bounded. */
   AI_TIMEOUT_MS: z.coerce.number().default(10_000),
+
+  /**
+   * Phase 3 Step 6 — how long SIGTERM waits for in-flight jobs before exiting.
+   *
+   * A HARD DEADLINE, not a target. `worker.close()` waits for current jobs
+   * indefinitely (`[CODE]` bullmq worker.js:803 — `whenCurrentJobsFinished`
+   * with no bound), so an unattended shutdown can hang until the orchestrator
+   * SIGKILLs it, which is strictly worse than exiting deliberately.
+   *
+   * 8s is chosen against the container's termination grace period, not against
+   * the job: podman-compose defaults to 10s and `iris-worker` sets no
+   * `stop_grace_period`, so 8s leaves 2s to close Redis and exit cleanly.
+   *
+   * A worst-case attempt is ~20s (5 + 10 + 5), so a job caught mid-flight will
+   * NOT finish inside the window. That is deliberate and safe: the job keeps
+   * its lock, the lock expires after LOCK_DURATION_MS
+   * (index.ts), and BullMQ's stalled check re-runs it. Idempotency (`UNIQUE(event_id, feature)`) makes the
+   * re-run free.
+   */
+  AI_WORKER_DRAIN_MS: z.coerce.number().int().min(1000).default(8000),
 });
 
 const parsed = Env.safeParse(process.env);

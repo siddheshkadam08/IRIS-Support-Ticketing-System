@@ -21,6 +21,19 @@ export async function emitEvent(
   payload: Record<string, unknown>,
   aggregate = 'ticket',
   aggregateId?: string,
+  /**
+   * The event's product, when the caller's scope does not identify it.
+   *
+   * The default — first entry of the caller's scope — is right for the /v1
+   * surface, where a request is authenticated as exactly one product. It is
+   * WRONG for an admin actor: a super_admin has an EMPTY scope, so the default
+   * yields NULL and the AI dispatcher (which requires product_id IS NOT NULL)
+   * would silently never pick the row up; a product_admin managing several
+   * tenants would get whichever happened to sort first. Callers that know the
+   * authoritative product — read from a database row, never from the client —
+   * pass it here.
+   */
+  productId?: string,
 ): Promise<string> {
   const eventId = newId('evt');
   await tx.query(
@@ -29,7 +42,7 @@ export async function emitEvent(
      VALUES ($1,$2,$3,$4,$5,$6,$7)`,
     [
       eventId,
-      ctx.productScope[0] ?? null,
+      productId ?? ctx.productScope[0] ?? null,
       aggregate,
       aggregateId ?? null,
       eventType,

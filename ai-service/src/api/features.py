@@ -57,6 +57,42 @@ def run_noop(req: ExecuteRequest) -> AIResult:
     )
 
 
+# ── Phase 3 Step 6: where the inference timeout goes ─────────────────────
+#
+# THERE IS NO TIMEOUT HERE, AND THAT IS CORRECT TODAY. `run_noop` is pure CPU
+# over a string already in memory: no socket, no subprocess, no model, nothing
+# that can block. A timeout around it would guard against nothing while
+# implying a bound that does not exist.
+#
+# The boundary that DOES exist is the caller's: worker/src/ai-client.ts aborts
+# at AI_TIMEOUT_MS (10s), so this service can never hold a worker slot open.
+#
+# WHEN A REAL PROVIDER ARRIVES, the timeout belongs HERE, inside the handler,
+# and it must be STRICTLY SHORTER than the worker's 10s — the frozen design
+# says 8s. The ordering is the whole point:
+#
+#   Python stops first  -> the worker gets a deterministic 5xx it can classify
+#                          -> BullMQ owns the retry
+#
+#   Worker stops first  -> the provider call is still running, unowned, while
+#                          a retry starts a second one. Two concurrent calls
+#                          per attempt, neither cancellable, billed twice.
+#
+# Two further requirements for that change, neither satisfiable today:
+#
+#   1. The timeout must CANCEL the provider call, not merely stop waiting for
+#      it. `asyncio.wait_for` cancels an awaitable; a blocking SDK call in a
+#      thread cannot be cancelled at all and needs the provider's own
+#      client-side timeout instead.
+#   2. Handlers are currently SYNCHRONOUS and are called directly on the event
+#      loop (see app.py). A blocking provider call added as-is would stall the
+#      whole service, not just its own request. An async handler signature, or
+#      run_in_threadpool, is a prerequisite.
+#
+# Recorded rather than pre-built: a timeout wrapping a stub proves nothing and
+# would have to be rewritten around whichever of the two shapes the provider
+# turns out to need.
+
 FEATURES: dict[str, Callable[[ExecuteRequest], AIResult]] = {
     "noop": run_noop,
 }

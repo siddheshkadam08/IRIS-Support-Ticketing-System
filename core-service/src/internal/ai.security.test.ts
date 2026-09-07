@@ -323,3 +323,103 @@ describe('the gateway does not expose the internal namespace', () => {
     expect(src).not.toContain('/internal/ai');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 3 Step 4 — a terminal failure report is just a result, so it inherits
+// the whole Phase 2 chain. These prove the inheritance rather than assuming it:
+// a worker must not be able to close another tenant's execution.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('terminal failure reports carry no extra authority', () => {
+  const terminal = (productId: string, ticketId: string) => ({
+    job_id: newId('aij'),
+    feature: 'noop',
+    attempt: 6,
+    correlation_id: 'req_attack',
+    claimed_product_id: productId,
+    claimed_ticket_id: ticketId,
+    result: {
+      feature: 'noop',
+      status: 'failed',
+      data: {},
+      error: {
+        kind: 'temporary',
+        code: 'retries_exhausted',
+        message: '6 attempts exhausted: ai_service_unreachable',
+      },
+    },
+  });
+
+  /** Row + audit state, so "nothing was written" can be asserted precisely. */
+  const stateOf = (eventId: string, ticketId: string) =>
+    withSystemScope('test', async (tx) => {
+      const ex = await tx.query(`SELECT status, error_code FROM ai_execution WHERE event_id = $1`, [
+        eventId,
+      ]);
+      const au = await tx.query<{ n: string }>(
+        `SELECT count(*) AS n FROM audit_event WHERE entity_id = $1 AND action LIKE 'ai.%'`,
+        [ticketId],
+      );
+      return { row: ex.rows[0] ?? null, audit: Number(au.rows[0]!.n) };
+    });
+
+  it('an unsigned terminal report is rejected and writes nothing', async () => {
+    const a = await createTicket(PRODUCT_A);
+    const before = await stateOf(a.eventId, a.ticketId);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/internal/ai/jobs/${a.eventId}/result`,
+      headers: { 'content-type': 'application/json' },
+      payload: terminal(PRODUCT_A, a.ticketId),
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(await stateOf(a.eventId, a.ticketId)).toEqual(before);
+  });
+
+  it('a signed report with a forged product claim is rejected', async () => {
+    const a = await createTicket(PRODUCT_A);
+    const before = await stateOf(a.eventId, a.ticketId);
+
+    const res = await postSigned(
+      `/internal/ai/jobs/${a.eventId}/result`,
+      terminal(PRODUCT_B, a.ticketId),
+    );
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).not.toContain('confidential ticket body');
+    expect(await stateOf(a.eventId, a.ticketId), 'no mutation').toEqual(before);
+  });
+
+  it('a signed report with a forged ticket claim is rejected', async () => {
+    const a = await createTicket(PRODUCT_A);
+    const other = await createTicket(PRODUCT_A);
+    const before = await stateOf(a.eventId, a.ticketId);
+
+    const res = await postSigned(
+      `/internal/ai/jobs/${a.eventId}/result`,
+      terminal(PRODUCT_A, other.ticketId),
+    );
+
+    expect(res.statusCode).toBe(400);
+    expect(await stateOf(a.eventId, a.ticketId)).toEqual(before);
+  });
+
+  it('cannot close an execution belonging to another product', async () => {
+    // Product B's event id, but claiming product A's ticket: the event
+    // resolves to B, the ticket claim does not match, so it is refused before
+    // any scope is built.
+    const a = await createTicket(PRODUCT_A);
+    const b = await createTicket(PRODUCT_B);
+
+    const res = await postSigned(
+      `/internal/ai/jobs/${b.eventId}/result`,
+      terminal(PRODUCT_B, a.ticketId),
+    );
+
+    expect(res.statusCode).toBe(400);
+    expect((await stateOf(b.eventId, b.ticketId)).row, 'B untouched').toBeNull();
+    expect((await stateOf(a.eventId, a.ticketId)).row, 'A untouched').toBeNull();
+  });
+});

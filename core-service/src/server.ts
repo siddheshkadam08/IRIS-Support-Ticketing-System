@@ -11,8 +11,10 @@ import { attachmentRoutes } from './attachments/attachment.routes.js';
 import { authRoutes } from './auth/auth.routes.js';
 import { adminRoutes } from './admin/admin.routes.js';
 import { adminTicketRoutes } from './admin/tickets.routes.js';
+import { aiOpsRoutes } from './admin/ai-ops.routes.js';
 import { startPublisher, stopPublisher } from './events/publisher.js';
 import { startAIDispatcher, stopAIDispatcher } from './events/ai-dispatcher.js';
+import { startAIReaper, stopAIReaper } from './events/ai-reaper.js';
 import { internalRoutes } from './internal/internal.routes.js';
 
 export async function buildServer() {
@@ -90,6 +92,8 @@ export async function buildServer() {
   await app.register(authRoutes);
   await app.register(adminRoutes);
   await app.register(adminTicketRoutes);
+  // Phase 3 Step 8: operational read + safe replay over ai_execution.
+  await app.register(aiOpsRoutes);
   // Service-to-service only. Authenticated by the x-internal-key hook above and
   // never routed by the gateway, which proxies /v1/* and /admin/api/* only.
   await app.register(internalRoutes);
@@ -115,11 +119,17 @@ async function main(): Promise<void> {
   // Refuses to start unless explicitly enabled AND given a watermark, so it
   // can never flood the queue with historical events.
   startAIDispatcher();
+  // Reconciles ai_execution rows left at 'running' by a crash, a stall, or a
+  // terminal report that never reached Core. Never re-enqueues anything —
+  // BullMQ remains the sole retry owner. Off unless AI_REAPER_ENABLED is set,
+  // because it is the one background loop that mutates business state.
+  startAIReaper();
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'shutting down');
     stopPublisher();
     await stopAIDispatcher();
+    await stopAIReaper();
     await app.close();
     await closePool();
     process.exit(0);

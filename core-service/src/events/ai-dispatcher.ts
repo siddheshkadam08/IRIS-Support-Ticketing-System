@@ -48,6 +48,7 @@ interface AIOutboxRow {
   event_type: string;
   request_id: string | null;
   created_at: Date;
+  payload: { ai_features?: unknown; replay_of?: unknown } | null;
 }
 
 export function startAIDispatcher(): void {
@@ -124,7 +125,7 @@ async function drain(from: Date): Promise<void> {
 
   const rows = await sys(async (tx) => {
     const { rows } = await tx.query<AIOutboxRow>(
-      `SELECT id, event_id, product_id, aggregate_id, event_type, request_id, created_at
+      `SELECT id, event_id, product_id, aggregate_id, event_type, request_id, created_at, payload
          FROM event_outbox
         WHERE published_at IS NULL
           AND event_type = ANY($1)
@@ -142,8 +143,32 @@ async function drain(from: Date): Promise<void> {
   for (const row of rows) await dispatch(q, row);
 }
 
+/**
+ * Which features this outbox row dispatches.
+ *
+ * The event type is the authority: `AI_EVENT_FEATURES` says what a
+ * `ticket.created` produces, and nothing in a payload may widen that.
+ *
+ * A Step 8 replay event additionally NARROWS it via `ai_features`, so
+ * replaying one failed feature re-runs only that feature rather than every
+ * feature the event type maps to. Today `ticket.created -> ['noop']` makes the
+ * two identical; from Phase 9, when one event fans out to classification AND
+ * sentiment AND summary, it is the difference between re-running the one thing
+ * that failed and re-running all of them.
+ *
+ * Implemented as an INTERSECTION on purpose. A payload is data, and data must
+ * never be able to make the dispatcher emit a feature the event type does not
+ * declare — that would turn an outbox row into an instruction.
+ */
+function featuresFor(row: AIOutboxRow): readonly AIFeature[] {
+  const declared = (AI_EVENT_FEATURES[row.event_type] ?? []) as readonly AIFeature[];
+  const requested = row.payload?.ai_features;
+  if (!Array.isArray(requested)) return declared;
+  return declared.filter((f) => requested.includes(f));
+}
+
 async function dispatch(q: Queue<AIJob>, row: AIOutboxRow): Promise<void> {
-  const features = (AI_EVENT_FEATURES[row.event_type] ?? []) as readonly AIFeature[];
+  const features = featuresFor(row);
   if (features.length === 0) return;
 
   try {
@@ -173,7 +198,9 @@ async function dispatch(q: Queue<AIJob>, row: AIOutboxRow): Promise<void> {
          *
          * `custom` means "ask the Worker's settings.backoffStrategy", which
          * implements the curve in @iris/shared/types/ai-retry — 1s, 5s, 25s,
-         * 120s (+/-20% jitter) across 5 attempts, a ~2.5 minute retry window.
+         * 120s, 600s (+/-20% jitter) across 6 attempts, a ~12.5 minute retry
+         * window. Six attempts because N delays need N+1 attempts to all be
+         * reachable; at 5 the 600s tail was dead configuration.
          *
          * This replaces exponential(1000), which produced 1s/2s/4s/8s — a
          * ~15 second window that dead-lettered every in-flight job during a

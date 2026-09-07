@@ -191,3 +191,93 @@ export async function completeExecution(
   );
   return rows[0] ?? null;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 3 Step 5 — abandoned-execution reaper
+// ─────────────────────────────────────────────────────────────────────────
+
+/** The subset a reaper cycle needs. Deliberately not the whole row. */
+export interface StaleExecution {
+  id: string;
+  event_id: string;
+  feature: string;
+  job_id: string | null;
+  correlation_id: string | null;
+  product_id: string;
+  ticket_id: string;
+  attempt: number;
+  created_at: Date;
+}
+
+/**
+ * Executions that have been `running` longer than the stale threshold.
+ *
+ * Read-only and CROSS-TENANT by nature — reconciliation cannot be scoped to
+ * one product — so the caller runs this under withSystemScope. It reads
+ * ai_execution only: product_id and ticket_id are already on the row, so no
+ * ticket or outbox lookup is needed, and the per-row write can be scoped from
+ * the row itself.
+ *
+ * The cutoff is computed in SQL against now(), the SAME clock that wrote
+ * created_at. That removes clock skew from the design entirely — computing a
+ * cutoff in Node would reintroduce it for nothing.
+ */
+export async function findStaleRunningExecutions(
+  tx: Tx,
+  staleMinutes: number,
+  limit: number,
+): Promise<StaleExecution[]> {
+  const { rows } = await tx.query<StaleExecution>(
+    `SELECT id, event_id, feature, job_id, correlation_id, product_id, ticket_id, attempt, created_at
+       FROM ai_execution
+      WHERE status = 'running'
+        AND created_at < now() - ($1 || ' minutes')::interval
+      ORDER BY created_at ASC
+      LIMIT $2`,
+    [String(staleMinutes), limit],
+  );
+  return rows;
+}
+
+/**
+ * Close an abandoned execution: running -> failed, error_code 'abandoned'.
+ *
+ * TWO GUARDS, both load-bearing:
+ *
+ *   status = 'running'
+ *     The universal arbitration used by completeExecution too. A result or a
+ *     Step 4 terminal report that committed first makes this match 0 rows, so
+ *     the reaper can never overwrite a terminal state.
+ *
+ *   job_id IS NOT DISTINCT FROM $2
+ *     Closes a race the status guard alone does not. Between the candidate
+ *     scan and this update, a re-dispatched outbox row can be re-claimed by a
+ *     NEW job: claimExecution's ON CONFLICT sets a new job_id while leaving
+ *     status 'running'. The reaper would then reap live work. Comparing
+ *     against the job_id we actually asked BullMQ about makes that 0 rows.
+ *     IS NOT DISTINCT FROM so a NULL job_id compares correctly.
+ *
+ * created_at is deliberately NOT re-checked: it is set on INSERT and never
+ * updated (claimExecution's DO UPDATE touches only job_id and attempt), so a
+ * re-check would guard nothing.
+ *
+ * Returns null when another writer won. That is expected, not an error.
+ */
+export async function reapExecution(
+  tx: Tx,
+  args: { id: string; expectedJobId: string | null; errorMessage: string },
+): Promise<AIExecutionRow | null> {
+  const { rows } = await tx.query<AIExecutionRow>(
+    `UPDATE ai_execution
+        SET status        = 'failed',
+            error_code    = 'abandoned',
+            error_message = $3,
+            completed_at  = now()
+      WHERE id = $1
+        AND status = 'running'
+        AND job_id IS NOT DISTINCT FROM $2
+     RETURNING ${COLUMNS}`,
+    [args.id, args.expectedJobId, args.errorMessage.slice(0, 500)],
+  );
+  return rows[0] ?? null;
+}

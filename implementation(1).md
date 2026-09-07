@@ -1850,15 +1850,17 @@ core-service accepts on every route.
 
 **Phase 3 — Reliability Foundation**
 
-Status: `🟡 In Progress`
+Status: `🟢 COMPLETE`
   · Step 1 audit: complete (3 P1, 5 P2, 3 P3 found)
   · Step 2 design freeze: complete
   · **Step 3 retry hardening: 🟢 COMPLETE** — see §43C
-  · Step 4 terminal-failure reporting: not started
-  · Step 5 abandoned-execution reaper: not started
-  · Step 6 timeout hardening: not started
+  · **Step 4 terminal-failure reporting: 🟢 COMPLETE** — see §43D
+  · **Step 5 abandoned-execution reaper: 🟢 COMPLETE** — see §43E
+  · **Step 6 timeout hardening: 🟢 COMPLETE** — see §43F
+  · **Step 7 reliability test hardening: 🟢 COMPLETE** — see §43G
+  · **Step 8 operational query + safe replay: 🟢 COMPLETE** — see §43H
 
-**Next:** Phase 3 Step 4 — Terminal Failure Reporting.
+**Phase 3 is COMPLETE.** Final architecture and invariant audit: §43I.
 
 ---
 
@@ -2834,33 +2836,35 @@ A rate-limit window would have dead-lettered every job instead of waiting.
 
 | Property | Value |
 |---|---|
-| Attempts | **5** (unchanged) |
+| Attempts | **6** |
+| Retry delays | **5** — every curve entry is reachable |
 | Curve | **1s, 5s, 25s, 120s, 600s** — the same array `publisher.ts` already uses |
 | Jitter | **±20%, two-sided** |
-| Reachable window at 5 attempts | **151 s (~2.5 min)** |
+| Retry window | **751 s (~12.5 min)** |
 | Retry owner | **BullMQ, still the only one** |
 
-### ⚠️ Only four of the five delays are reachable
+### Attempt-count correction
 
-`[CODE][TEST][LIVE]` BullMQ retries while `attemptsMade + 1 < attempts`, so with
-5 attempts the strategy is called with 1, 2, 3, 4 and the 5th execution is
-terminal:
+`[CODE][TEST][LIVE]` BullMQ retries while `attemptsMade + 1 < attempts`, so
+**N delays require N+1 attempts** for all of them to be reachable:
 
 ```
-execution 1 fails -> 1s     execution 4 fails -> 120s
-execution 2 fails -> 5s     execution 5 fails -> TERMINAL
-execution 3 fails -> 25s
-                            window = 151s
+execution 1 fails -> 1s      execution 4 fails -> 120s
+execution 2 fails -> 5s      execution 5 fails -> 600s
+execution 3 fails -> 25s     execution 6 fails -> TERMINAL
+
+window = 1 + 5 + 25 + 120 + 600 = 751s (~12.5 min)
 ```
 
-The 600s entry is retained but **unreachable**. Reaching the ~12.5-minute window
-described in the Step 2 design requires `AI_RETRY_ATTEMPTS = 6`, which was
-explicitly frozen at 5. Raising it is a one-constant change and is asserted by
-test — but it also raises maximum job lifetime, which the Step 5 reaper
-threshold is derived from, so it is a deliberate decision rather than a default.
+**Resolution of the Step 2 contradiction.** Step 2 contained an internal
+contradiction between "5 total attempts" and a five-delay retry curve. Step 3
+initially implemented five total attempts, which made the 600s delay
+unreachable and capped the window at 151s. This correction resolves the
+contradiction in favour of the documented platform retry curve by using six
+total attempts.
 
-**This is a documented deviation from the Step 2 design, which asserted both
-"5 attempts" and "~12.5 min". Those two cannot both hold. 5 attempts won.**
+The earlier statement that the 600s entry is unreachable is **superseded** —
+it was true only of the five-attempt configuration and no longer applies.
 
 ### Classification
 
@@ -2930,7 +2934,24 @@ migration · outbox · audit · RLS · Core internal API · Python service.
 | `test:ai` / `test:hmac` | ✅ 44/44 · 15/15 |
 | `smoke` / `-admin` / `-contract` | ✅ 43 · 61 · 9 |
 
-`[LIVE]` **Measured retry curve** with the AI service stopped:
+`[LIVE]` **Production configuration**, read from a real enqueued job in Redis:
+
+```
+opts        {"attempts":6,"backoff":{"type":"custom"}, ...}
+atm         6          attemptsMade after exhaustion
+stacktrace  6 entries  six actual executions
+state       failed set no seventh attempt
+```
+
+`[LIVE]` The 600s tail was reached: the fifth failure logged
+`retry_in_ms: 655082`, inside the 600s ±20% band (480–720s), which only occurs
+if `aiRetryDelayMs(5)` was consulted. The wall-clock gap before the sixth
+execution is **not** clean evidence — the host suspended during the wait — so
+the 600s delay is reported as *selected and applied by BullMQ*, not as an
+observed 600-second wall-clock wait.
+
+`[LIVE]` **Measured retry curve** (earlier five-attempt run, gaps 1→5 unchanged
+by this correction) with the AI service stopped:
 
 ```
 attempt 1  14:13:49
@@ -2952,7 +2973,30 @@ at 1/10 scale.
 `[TEST]` HMAC unchanged — every attempt still signs a fresh timestamp, nonce and
 signature; no headers are cached across attempts.
 
-## 43C.7 Deferred to later Phase 3 steps
+## 43C.7 ⚠️ Consequence for Step 5 (reaper)
+
+**Maximum job lifetime has changed and the Step 5 reaper threshold MUST be
+recalculated.**
+
+The Step 2 draft threshold of 45 minutes was derived from a 151s retry window.
+It is now stale:
+
+```
+retry window                751s   (was 151s)
++ 6 attempts x ~20s work    120s   (was 100s)
+  max job lifetime         ~871s   ~14.5 min   (was ~4.2 min)
++ one stall recovery       ~901s               (maxStalledCount = 1)
+  worst-case lifetime     ~1772s   ~29.5 min
++ queue wait + clock tolerance
+```
+
+Step 5 must derive its stale threshold from **this** lifetime rather than
+inheriting the 45-minute figure. Reaping below the true maximum lifetime would
+mark live, legitimately-retrying work as abandoned — the exact failure the
+reaper exists to prevent. Recorded here so the derivation is redone, not
+assumed.
+
+## 43C.8 Deferred to later Phase 3 steps
 
 Terminal-failure reporting (Step 4) · reaper (Step 5) · Python inference
 timeout, `statement_timeout`, `lock_timeout`, `lockDuration`, bounded shutdown
@@ -2961,7 +3005,983 @@ replay (Step 8) · `Retry-After` · duplicate-inference prevention.
 
 ---
 
+---
+
+# 43D. Phase 3 Step 4 — Terminal Failure Reporting
+
+## Status: 🟢 COMPLETE
+
+Implemented and verified on the running system, 2026-09-08.
+
+## 43D.1 The gap this closed
+
+`[CODE]` `submitAIResult` was only reachable on the happy path. A job that
+exhausted its retries, or failed permanently, threw before it — so
+`ai_execution` stayed `running` forever while BullMQ quietly moved the job to
+its failed set.
+
+`[LIVE]` The Phase 3 Step 1 audit found **13 rows stuck `running`**, the oldest
+for 1h54m, two correlating exactly with dead-lettered jobs.
+
+## 43D.2 What was implemented
+
+**Worker-side only. Core needed no production change** — the failed branch of
+`submitAIResult` already recorded `status='failed'`, `error_code`,
+`error_message` and `completed_at`, already guarded on `WHERE status='running'`,
+and already wrote the audit row in the same transaction.
+
+```
+BullMQ 'failed' event
+      ↓
+shouldReportTerminal(job, err)      permanent OR attemptsMade >= attempts
+      ↓  (false → return; BullMQ will retry)
+buildTerminalResult(job, err)       existing AIResultRequest, data: {}
+      ↓
+POST /internal/ai/jobs/:eventId/result   existing signed client
+      ↓
+ai_execution: running → failed + audit   (one transaction, existing code)
+```
+
+**Both terminal classes are reported**, because neither previously reached Core
+and the two paths are mutually exclusive by construction: if `submitAIResult`
+succeeds the job *completes* and `failed` never fires.
+
+| Failure | Reported | `error_code` |
+|---|---|---|
+| Permanent (malformed response, invalid job, Core 4xx) | ✅ at attempt 1 | the permanent code, e.g. `ai_http_422` |
+| Temporary, attempts 1–5 | ❌ **never** — BullMQ will retry | — |
+| Temporary, attempt 6 | ✅ once | `retries_exhausted` |
+| Success | ❌ never | — |
+
+## 43D.3 Two hazards handled explicitly
+
+**Async listener.** `[CODE]` BullMQ emits `failed` through a plain
+EventEmitter (`worker.js:686`) and does **not** await listeners, so an escaping
+rejection is an unhandled rejection — which Node aborts the process on.
+`reportTerminalFailure` therefore never throws: every path returns a
+`TerminalOutcome`, the call site uses `void … .catch(…)`, and a test asserts on
+the process-level `unhandledRejection` signal rather than trusting the
+try/catch by inspection.
+
+**Error-message safety.** `[CODE]` `err.message` is `` `${code}: ${detail}` ``
+where `detail` is up to 500 bytes of a raw upstream body — which a real
+provider could fill with echoed prompt or ticket content. The persisted message
+is normalised to the machine code only:
+
+```
+6 attempts exhausted: provider_timeout
+permanent failure: malformed_ai_response
+```
+
+Full detail stays in the structured log, where redaction already applies. A
+test feeds a body containing a fake password and card number and asserts
+neither reaches the payload.
+
+## 43D.4 No second retry owner
+
+**One report attempt. No retry, no re-enqueue, no timer, no queue, no counter.**
+
+If Core is unreachable the reporter logs and stops; the execution stays
+`running` and the **Step 5 reaper** reconciles it. A 404 (`ticket_not_found`)
+means no execution row was ever claimed — nothing to close, nothing stuck — and
+is logged at `info` as a normal terminal condition, not a fault. `[LIVE]`
+verified during the design freeze.
+
+## 43D.5 Idempotency and terminal-state immutability
+
+Entirely inherited from the existing `WHERE status='running'` guard — no new
+mechanism, no new table, no Redis:
+
+| Sequence | Outcome |
+|---|---|
+| First terminal report | `running → failed`, 1 audit row, `applied:true` |
+| Duplicate report | `applied:false`, **no second audit row** `[LIVE]` |
+| Concurrent reports | row lock serialises; exactly one wins `[TEST]` |
+| Success then failure | stays `succeeded` `[TEST]` |
+| **Failure then success** | **stays `failed`**, result not persisted `[LIVE]` |
+
+A late success is distinguishable from a routine duplicate — the response
+carries `status:'failed'` with `applied:false` — and is logged at `error` as an
+invariant violation.
+
+## 43D.6 Files
+
+**Created (2):** `worker/src/terminal-report.ts` · `worker/src/terminal-report.test.ts`
+
+**Modified (4):** `worker/src/index.ts` (failed handler) ·
+`worker/src/retry.integration.test.ts` · `core-service/src/internal/ai.internal.test.ts` ·
+`core-service/src/internal/ai.security.test.ts`
+
+**Unchanged:** `ai.service.ts`, `ai.repo.ts`, `ai.routes.ts`,
+`internal.routes.ts`, `service-auth.ts`, `audit/index.ts`, `shared/types/ai.ts`,
+`shared/hmac-utils/**`, every migration, the Python service, the dispatcher.
+
+**No schema change, no new endpoint, no new dependency, no new env var, no new
+infrastructure.**
+
+## 43D.7 Verification
+
+`[TEST]` typecheck clean · vitest **371 passed / 14 files** (+53) · pytest
+**59 passed, 1 skipped** · smoke **43 / 61 / 9**.
+
+New: `terminal-report.test.ts` **34** · `ai.internal.test.ts` 26→**36** ·
+`ai.security.test.ts` 13→**17** · `retry.integration.test.ts` 8→**13**.
+
+`[TEST]` Against real BullMQ + Redis: six temporary failures → **exactly one**
+report at attempt 6 with `retries_exhausted`; permanent → one execution, one
+report with its own code; success → **zero** reports; four failures with
+attempts remaining → **zero** reports; a Core outage → **one** report attempt,
+job not re-enqueued, no unhandled rejection.
+
+`[LIVE]` **Scenario A — permanent failure** (whitespace-only description, which
+the Python stub already rejects as `invalid_input`; no test backdoor):
+
+```
+status=failed  attempt=1  error_code=ai_http_422
+error_message="permanent failure: ai_http_422"   ← normalised
+completed_at stamped       result NULL       audit: 1 × ai.execution_failed
+```
+
+`[LIVE]` **Scenario C — success:** `succeeded`, zero terminal reports.
+
+`[LIVE]` **Scenarios E and F** against the failed execution above: duplicate →
+`applied:false`; late success → `applied:false`, **status remains `failed`**,
+`result` still NULL, still one audit row.
+
+`[LIVE]` **Scenario B — retry exhaustion**, full 6-attempt curve observed:
+
+```
+attempt 1  18:36:47
+attempt 2  18:36:48   +  1s   [curve 1s]
+attempt 3  18:36:54   +  6s   [curve 5s   +/-20%]
+attempt 4  18:37:15   + 21s   [curve 25s  +/-20%]
+attempt 5  18:39:32   +137s   [curve 120s +/-20%]
+attempt 6  18:49:55   +623s   [curve 600s +/-20%]   <- the tail
+total 788s across 6 executions; every gap inside its band
+
+terminal reports: 1, at attempt 6 -- zero during attempts 1-5
+
+status=failed  attempt=6  error_code=retries_exhausted
+error_message="6 attempts exhausted: ai_service_unreachable"
+completed_at stamped   result NULL   audit: 1 x ai.execution_failed (actor=system)
+ticket: status=open  classification_source=unclassified  summary=NULL
+```
+
+`[TEST] not [LIVE]` **Scenario D — Core unavailable during reporting.** Proven
+deterministically against real BullMQ with a failing transport. A live
+reproduction needs Core up for `/input` and down for the report ~1 second
+later; making that reliable would require a test-only seam in production code,
+which the step forbids.
+
+## 43D.8 Security
+
+`[TEST]` A terminal report is just a result, so it inherits the whole Phase 2
+chain: unsigned → **401**, forged `claimed_product_id` → **400**, forged
+`claimed_ticket_id` → **400**, product-B event claiming a product-A ticket →
+**400** — each asserted to leave `ai_execution` and `audit_event` byte-identical.
+HMAC untouched; every report signs a fresh timestamp, nonce and signature
+through the existing client.
+
+## 43D.9 Operational query
+
+Available now, with no Step 8 work:
+
+```sql
+SELECT id, event_id, feature, ticket_id, product_id, job_id, attempt,
+       error_code, error_message, completed_at
+  FROM ai_execution
+ WHERE status = 'failed' AND error_code = 'retries_exhausted'
+ ORDER BY completed_at DESC;
+```
+
+## 43D.10 What remains for Step 5
+
+Step 4 closes the cases where **the worker is alive and able to speak**. The
+reaper still owns:
+
+- Core unavailable during the report → row stays `running`
+- worker crashes mid-report → the `failed` event is not replayed on restart
+- **stall-induced failures** — `[CODE]` `moveStalledJobsToWait` emits only
+  `'stalled'` (`worker.js:933`), never `'failed'`, so a job killed by
+  `maxStalledCount` never reaches the handler at all
+- jobs evicted from Redis retention
+- rows claimed via `/input` whose worker never returned
+
+✅ **Resolved in Step 5.** The threshold was recomputed from the corrected 751s
+window — see §43E.2. It lands on 45 minutes again, but as a derived number
+rather than an inherited one.
+
+---
+
+# 43E. Phase 3 Step 5 — Abandoned-Execution Reaper
+
+## 43E.1 The gap this closes
+
+Step 4 closes a terminal failure **whenever the worker is alive to report it**.
+Everything else still leaves `ai_execution.status = 'running'` forever:
+
+| Crash window | Why Step 4 cannot close it |
+|---|---|
+| Core unavailable during the report | the reporter deliberately does not retry |
+| worker crashes mid-report | BullMQ does not replay the `failed` event on restart |
+| stall-induced failure | `[CODE]` `moveStalledJobsToWait` emits only `'stalled'` (`worker.js:933`), never `'failed'` — the handler is never reached |
+| job evicted from Redis retention | there is no job left to fail |
+| `/input` claimed a row, worker never returned | nothing ever authored a result |
+
+The reaper reconciles those rows. It is **not** a retry mechanism: it never
+enqueues, promotes or re-runs anything. BullMQ remains the sole retry owner.
+
+## 43E.2 The threshold, recomputed from the corrected window
+
+The Step 2 draft of 45 minutes was derived from the superseded 151s window, so
+§43C flagged it as stale. Recomputed against the corrected **751s** window:
+
+```
+retry delays, jitter at the +20% ceiling      751 x 1.2   = 901s
+6 attempts x 20s HTTP budget                              = 120s
+one stall recovery (lockDuration + stalledInterval)       =  60s
+                                            worst case   ~1081s  (~18 min)
++ queue backlog (~5 min) + poll granularity (1 min)       ~24 min floor
+```
+
+`AI_REAPER_STALE_MINUTES` defaults to **45** — 2.5x the worst-case job
+lifetime. The number is unchanged from the Step 2 draft, but it is now
+*derived* rather than inherited: at 151s the same 45 was ~18x headroom, and had
+the window grown a little further it would have been wrong.
+
+`z.coerce.number().int().min(15)` refuses anything below the worst case at
+config load, rather than trusting the operator not to reap live work.
+
+## 43E.3 The decision matrix
+
+`decideForJobState` is an exhaustive `switch` with a `never` assignment in the
+default branch, so a BullMQ upgrade that adds a state **fails the build**
+instead of silently falling into the reap branch.
+
+| BullMQ state | Decision | Why |
+|---|---|---|
+| `active` | RETAIN | a worker holds it right now |
+| `waiting` | RETAIN | queued |
+| `delayed` | RETAIN | **the 600s retry tail lives here for ten minutes** |
+| `waiting-children` | RETAIN | unused today, protected anyway |
+| `prioritized` | RETAIN | unused today, protected anyway |
+| `failed` | REAP | dead-lettered; BullMQ will never run it again |
+| `completed` | REAP | the job finished but Core never recorded a result |
+| `unknown` | REAP | evicted, flushed, or never enqueued |
+| lookup failed | **RETAIN** | not evidence the job is gone — see §43E.5 |
+| `job_id IS NULL` | REAP | no worker can ever resolve it; BullMQ is not consulted |
+
+The asymmetry is deliberate. Retaining a dead row leaves a stuck row; reaping a
+live one destroys work that was about to succeed.
+
+## 43E.4 Three phases, and why they are separate
+
+```
+1. candidate SELECT     short, read-only, cross-tenant (withSystemScope)
+2. BullMQ state check   OUTSIDE any transaction
+3. one short UPDATE     per reapable row, scoped to THAT row's tenant
+```
+
+Phase 2 must not run inside a transaction. Holding row locks across Redis
+latency would couple database availability to Redis responsiveness — the
+opposite of what a recovery mechanism should do.
+
+Tenant scope in phase 3 comes from the **database row**, never from the BullMQ
+payload: the reaper only ever sends BullMQ a job id and receives a state string
+back. The scope it builds (`productScope: [row.product_id]`, `role: 'none'`) is
+identical to the one `ai.service.ts` builds for a worker-reported result.
+
+## 43E.5 The bug live verification found
+
+The design said "Redis lookup throws → RETAIN". The implementation caught the
+throw correctly, and the unit tests passed. **Against a real dead Redis it
+never executed**, because `[LIVE]` `Queue.getJobState` awaits BullMQ's
+`waitUntilReady()`, and that promise does not reject while Redis is
+unreachable — it never settles at all. Verified with both
+`maxRetriesPerRequest: null` and `enableOfflineQueue: false`: still pending
+after 12s in each case.
+
+So the cycle did not take the retain path; it **hung on its first candidate
+forever**, logging nothing. Safe by accident, unobservable, and permanently
+wedged.
+
+The fix is a bounded lookup (`LOOKUP_TIMEOUT_MS = 5_000`) plus a `redisDown`
+short-circuit — Redis is up or down for the whole batch, so one failure
+condemns the cycle rather than costing 50 x 5s. `[LIVE]` a three-candidate
+outage cycle now completes in **5048ms** with `reaped: 0, skipped_redis: 3` and
+an explicit ERROR line.
+
+The lesson generalises: a stub that *rejects* does not reproduce a dependency
+that *hangs*, and only the second is what an outage actually looks like.
+
+## 43E.6 The two guards on the UPDATE
+
+```sql
+WHERE id = $1
+  AND status = 'running'
+  AND job_id IS NOT DISTINCT FROM $2
+```
+
+`status = 'running'` is the universal arbitration already used by
+`completeExecution`: a result or a Step 4 report that committed first makes
+this match zero rows, so the reaper can never overwrite a terminal state.
+
+`job_id IS NOT DISTINCT FROM` closes a race the status guard alone does not.
+Between the scan and the UPDATE, a re-dispatched outbox row can be re-claimed
+by a **new** job — `claimExecution`'s `ON CONFLICT` sets a new `job_id` while
+leaving status `running`. Without this the reaper would abandon live work.
+`created_at` is deliberately **not** re-checked: it is set on INSERT and never
+updated, so it would guard nothing.
+
+The audit row is written in the **same transaction** as the UPDATE, so an
+execution can never become terminal without its audit row. Losing the race
+writes no audit row at all.
+
+## 43E.7 Files
+
+| File | Change |
+|---|---|
+| `core-service/src/events/ai-reaper.ts` | **new** — decision matrix, lifecycle, three-phase cycle |
+| `core-service/src/events/ai-reaper.test.ts` | **new** — 45 tests (unit + integration) |
+| `core-service/src/internal/ai.repo.ts` | `findStaleRunningExecutions`, `reapExecution`, `StaleExecution` |
+| `core-service/src/config.ts` | `AI_REAPER_ENABLED`, `AI_REAPER_STALE_MINUTES` |
+| `core-service/src/server.ts` | `startAIReaper()` / `await stopAIReaper()` in the existing lifecycle |
+| `.env`, `.env.example` | the two new settings, documented |
+
+Interval (60s) and batch (50) are hardcoded: neither needs operational tuning.
+The timer is `unref()`d and guarded by `isRunning`, and there is **no immediate
+startup cycle** — a restart storm cannot produce a reaping burst.
+
+## 43E.8 Verification
+
+`[TEST]` 45 tests, all passing. Full regression: 416 vitest across 15 files,
+59 pytest (+1 skipped), 44/44 `test:ai`, 15/15 `test:hmac`, 43/61/9 smoke.
+
+`[LIVE]` against real Postgres, real Redis, real BullMQ, the real
+`startAIReaper()` timer:
+
+| Scenario | Result |
+|---|---|
+| stale + real BullMQ `failed` job | `failed/abandoned` |
+| stale + job id BullMQ never had | `failed/abandoned` |
+| stale + real BullMQ `delayed` job | **`running`** — untouched |
+| stale + `job_id IS NULL` | `failed/abandoned` |
+| 2-minute-old row + dead job | **`running`** — below threshold |
+| Redis unreachable (3 candidates) | 0 reaped, 3 skipped, 5048ms |
+| `AI_REAPER_ENABLED=false`, 90-min row | **`running`** — never started |
+| real `completed` job (report lost) | `failed/abandoned`, audit `job_state: completed` |
+| no startup cycle | all rows still `running` at t+5s; one cycle at t+60s |
+
+`[LIVE]` the work also cleared the standing backlog. `ai_execution` held **16**
+rows stuck at `running` (oldest 7h44m) at the start of Step 5 and holds
+**zero** now. The current `abandoned` count (113) mixes those with rows the
+test suite seeds and reaps deliberately, so it is not a production incident
+count — the query in §43E.9 filtered by `completed_at` is what to use.
+
+## 43E.9 Operational query
+
+```sql
+-- Executions the reaper closed, newest first.
+SELECT id, product_id, ticket_id, attempt, error_message, completed_at
+  FROM ai_execution
+ WHERE status = 'failed' AND error_code = 'abandoned'
+ ORDER BY completed_at DESC;
+
+-- Anything currently at risk of being reaped.
+SELECT id, job_id, attempt, now() - created_at AS age
+  FROM ai_execution
+ WHERE status = 'running' AND created_at < now() - interval '45 minutes'
+ ORDER BY created_at;
+```
+
+A non-zero `skipped_redis` in the `AI reaper cycle completed` line means Redis
+was unreachable and **nothing was reaped that cycle** — the correct behaviour,
+and the line to alert on.
+
+---
+
+# 43F. Phase 3 Step 6 — Timeout Hardening
+
+## 43F.1 The failure mode this addresses
+
+Steps 3–5 handle a dependency that **fails**. This one handles a dependency
+that stays connected and simply stops answering — the case where nothing
+throws, nothing retries, and nothing is reaped, because from the caller's point
+of view the operation is still in progress.
+
+A timeout is a **failure signal, not a second retry mechanism**. Every boundary
+below converts "waiting forever" into a typed, classified error that the
+existing BullMQ → terminal-report → reaper architecture already knows how to
+handle. Nothing new schedules, sleeps or re-invokes anything.
+
+## 43F.2 The hierarchy
+
+Each bound is shorter than the one that contains it, so the **inner** boundary
+always fires first and the outer one never has to guess.
+
+```
+reaper stale threshold          45 min      §43E.2
+  > max job lifetime            ~18 min     751s retry window + attempts
+    > BullMQ lock               60 s        LOCK_DURATION_MS  (was 30s)
+      > one attempt             20 s        5 + 10 + 5, sequential
+        > worker -> Python      10 s        AI_TIMEOUT_MS
+        > DB statement          10 s        statement_timeout
+          > worker -> Core       5 s        CORE_TIMEOUT_MS
+          > DB acquisition       5 s        connectionTimeoutMillis
+          > reaper job lookup    5 s        LOOKUP_TIMEOUT_MS   §43E.5
+            > DB lock            3 s        lock_timeout
+```
+
+`[LIVE]` The ordering is not theoretical. With Postgres frozen, Core stalled
+inside its own query and **the worker gave up first at 5s** with
+`core_timeout` — before Core's own 10s statement timeout could fire. The inner
+bound won, exactly as designed.
+
+## 43F.3 ⚠️ The defect the audit found
+
+`AbortSignal.timeout` was already applied to both worker HTTP clients. It was
+not doing what the code assumed.
+
+`[LIVE]` `fetch` resolves as soon as the response **headers** arrive. Verified
+against a server that answers `200` plus a partial body and then goes quiet:
+`fetch` resolved in **85ms**, and the timeout then fired **1526ms later inside
+`res.json()`** as `name: 'TimeoutError'` — not a `SyntaxError`, and with no
+`cause`.
+
+In `ai-client.ts` that landed in the catch block for malformed JSON:
+
+```ts
+try { body = await res.json(); }
+catch (err) { throw new PermanentJobError('malformed_ai_response', ...); }
+```
+
+`PermanentJobError` extends `UnrecoverableError`, so **BullMQ stopped
+immediately**. A merely slow AI service was dead-lettered on attempt 1, with
+all six attempts and the entire 751s retry window unused — and the recorded
+cause said the response was malformed, which was false.
+
+The fix distinguishes the two by error name (`isAbortError`) and routes a
+timeout to `TemporaryJobError('ai_service_timeout')`. Genuine bad JSON stays
+permanent; that half is asserted separately so the branch was not simply
+widened.
+
+`core-client.ts` had the same exposure on its success path, where an unwrapped
+`res.json()` let a raw `TimeoutError` escape past the classifier entirely.
+
+## 43F.4 Error classification
+
+| Condition | Code | Class |
+|---|---|---|
+| connection refused / DNS | `core_unreachable`, `ai_service_unreachable` | temporary |
+| request timeout (no headers) | `core_timeout`, `ai_service_timeout` | temporary |
+| **timeout during body read** | `core_timeout`, `ai_service_timeout` | **temporary** (was permanent) |
+| malformed JSON body | `malformed_ai_response` | permanent |
+| 408, 429 | passthrough | temporary |
+| other 4xx | passthrough | permanent |
+| 5xx | passthrough | temporary |
+
+The flow is unchanged: timeout → temporary worker error → BullMQ retry →
+(after 6 attempts) the Step 4 terminal report. No client retries internally;
+`[TEST]` asserts exactly one HTTP request per timed-out call.
+
+## 43F.5 BullMQ lock headroom
+
+`[CODE]` The default `lockDuration` is 30_000 (bullmq worker.js:34) and Step
+5.1 measured only ~10s of headroom above a 20s worst-case attempt — enough that
+a GC pause or a busy event loop could lapse the lock on a job that was
+progressing normally. A lapsed lock is a stall recovery, which is a duplicate
+execution caused purely by configuration.
+
+`LOCK_DURATION_MS = 60_000` restores 40s of headroom. It is a **constant, not
+configuration**: it is derived from the timeouts either side of it, and tuning
+it alone would break a relationship rather than fix anything.
+
+`[CODE]` `lockRenewTime` is deliberately left unset — BullMQ defaults it to
+`lockDuration / 2` (worker.js:63-64), i.e. 30s, which is already correct.
+
+**The lock is not a timeout.** It says how long BullMQ waits before assuming
+this process died. Bounding the work is the job of the HTTP and database
+timeouts. The retry curve (1s, 5s, 25s, 120s, 600s; 6 attempts; ±20% jitter) is
+untouched.
+
+## 43F.6 Database protection
+
+Both are sent in the **startup packet** (`[CODE]` pg client.js:549-554), so
+Postgres enforces them server-side. That distinction is the point: a
+client-side timer abandons a query that keeps running on the server, still
+holding its locks. Here the server cancels the statement, the client receives a
+real error, and the connection returns to the pool healthy.
+
+| Setting | Value | Protects against |
+|---|---|---|
+| `statement_timeout` | 10s | a query that **runs** too long |
+| `lock_timeout` | 3s | a query that **waits** too long for a row lock |
+| `connectionTimeoutMillis` | 5s | an unbounded queue for a pool client |
+
+They are not interchangeable. `lock_timeout` is deliberately much shorter
+because blocking on a lock is contention, not progress — and the AI result path
+takes row locks on `ai_execution` that the reaper can also hold.
+
+Set at the **pool**, which is the correct scope here rather than a wider one:
+`withScope()` is documented as the only way to reach Postgres, so this single
+place covers every query including the AI path. Migrations and seeds are
+unaffected — they open their own `pg.Client` on `ADMIN_DATABASE_URL` and
+legitimately run long. The gateway's separate credential pool is outside the AI
+path and was not touched.
+
+`[TEST]` Eleven consecutive cancellations against a pool of 10 leave
+`idleCount > 0`, `waitingCount === 0`, and the pool still serving — a timeout
+that leaked its client would exhaust the pool and be worse than no timeout.
+
+## 43F.7 Bounded shutdown
+
+`[CODE]` `Worker.close()` calls `whenCurrentJobsFinished(false)` (worker.js:803)
+and waits for in-flight jobs **indefinitely**. `[TEST]` asserted directly: with
+a job running, `close()` was still pending after 3s. A worst-case attempt is
+~20s, longer than any sane grace period, so an unbounded close does not produce
+a graceful shutdown — it produces a SIGKILL mid-write.
+
+`AI_WORKER_DRAIN_MS = 8000` is a hard deadline, sized against the **container's
+termination grace period** (podman-compose default 10s, now stated explicitly
+on `iris-worker`), not against the job. A job caught mid-flight will *not*
+finish inside it, and that is deliberate: it keeps its lock, the lock expires
+after 60s, the stalled check re-runs it, and `UNIQUE(event_id, feature)` makes
+the re-run idempotent. **No recovery mechanism was added** — the job is handed
+back to the one that already owns this case.
+
+`close()` memoises its promise, so a second forced call cannot escalate the
+first. The deadline is the escalation.
+
+## 43F.8 Reaper lookup — regression check
+
+Step 5's bounded lookup is intact and now has an explicit guard on its value.
+`[LIVE]` re-verified against the running Core with Redis paused for 70s:
+
+```
+AI reaper skipping this cycle — BullMQ unreachable, retaining every candidate
+  job_id: aij_S6_REDIS_DOWN_0   remaining: 1
+  reason: "job state lookup exceeded 5000ms"
+AI reaper cycle completed  candidates: 2  reaped: 0  skipped_redis: 2
+```
+
+Both rows stayed `running`; the next cycle after Redis returned reaped them
+normally (`candidates: 2, reaped: 2`). A Redis outage still cannot cause mass
+reaping.
+
+## 43F.9 Resource cancellation
+
+| Resource | Cancelled? | Evidence |
+|---|---|---|
+| worker HTTP socket | **yes** | `[LIVE]` 6 aborted requests → 6 server-side connections opened, 6 closed; 0 connected sockets left |
+| Postgres statement | **yes** | server-side cancellation; connection reusable, no pool leak |
+| pool acquisition | **yes** | pg rejects the acquisition; nothing is checked out |
+| reaper Redis lookup | **partly** | the *cycle* is released at 5s; the underlying BullMQ promise may settle later and is given a no-op handler so it cannot become an unhandled rejection |
+| BullMQ in-flight job | **no, by design** | the job keeps its lock and is re-run by stall recovery |
+| Python inference | **n/a today** | no provider exists — see below |
+
+## 43F.10 Python: deferred, not invented
+
+`run_noop` is pure CPU over a string already in memory: no socket, no
+subprocess, no model, nothing that can block. A timeout there would guard
+nothing while implying a bound that does not exist, so **none was added**. The
+bound that does exist is the caller's 10s abort.
+
+The placement for a real provider is recorded in `features.py`, with the
+ordering requirement and two prerequisites that are not satisfiable today:
+
+1. The timeout must **cancel** the provider call, not merely stop waiting.
+   `asyncio.wait_for` cancels an awaitable; a blocking SDK call in a thread
+   cannot be cancelled and needs the provider's own client-side timeout.
+2. Handlers are currently **synchronous** and called directly on the event
+   loop. A blocking provider call added as-is would stall the whole service.
+
+The frozen target is **8s — strictly below the worker's 10s** — so Python stops
+first and the worker receives a deterministic failure it can classify. Inverted,
+the worker would abandon a provider call that keeps running and billing while a
+retry starts a second one.
+
+## 43F.11 Configuration
+
+One new environment variable, `AI_WORKER_DRAIN_MS` (schema-validated,
+`.env.example`-documented, default 8000). Everything else reuses an existing
+setting (`CORE_TIMEOUT_MS`, `AI_TIMEOUT_MS`) or is a constant, because a fixed
+internal safety limit derived from its neighbours is not a deployment choice.
+
+## 43F.12 Files
+
+| File | Change |
+|---|---|
+| `worker/src/errors.ts` | `isAbortError()` — separates a timeout from bad data |
+| `worker/src/ai-client.ts` | body-read timeout → temporary, not `malformed_ai_response` |
+| `worker/src/core-client.ts` | success-path body read wrapped; `core_timeout` code |
+| `worker/src/limits.ts` | **new** — `LOCK_DURATION_MS = 60_000` |
+| `worker/src/shutdown.ts` | **new** — `drainWorker()`, bounded, never rejects |
+| `worker/src/index.ts` | `lockDuration`, bounded shutdown, re-entrancy guard |
+| `worker/src/config.ts` | `AI_WORKER_DRAIN_MS` |
+| `core-service/src/db/pool.ts` | `statement_timeout`, `lock_timeout` |
+| `core-service/src/events/ai-reaper.ts` | `LOOKUP_TIMEOUT_MS` exported for the guard |
+| `ai-service/src/api/features.py` | documented provider-timeout placement |
+| `infra/podman-compose.yml` | `stop_grace_period: 10s`, `AI_WORKER_DRAIN_MS` |
+| `worker/src/timeouts.test.ts` | **new** — 37 tests |
+| `worker/src/shutdown.test.ts` | **new** — 8 tests |
+| `core-service/src/db/timeouts.test.ts` | **new** — 11 tests |
+
+## 43F.13 Verification
+
+`[TEST]` 473 vitest across 18 files (was 416/15) · 59 pytest (+1 skipped) ·
+44/44 `test:ai` · 15/15 `test:hmac` · 43/61/9 smoke · typecheck clean.
+
+The HTTP timeout tests run against **real loopback servers**, not stubbed
+transports — deliberately, because a stub that rejects up front cannot
+reproduce a socket that accepts and then goes quiet, which is the only shape in
+which the §43F.3 defect appears.
+
+`[LIVE]` against the restarted stack (Core logs `AI reaper started`, confirming
+it carries Steps 3–6):
+
+| Scenario | Observed |
+|---|---|
+| baseline ticket | `succeeded`, attempt 1 |
+| AI service stopped | `ai_service_unreachable`, temporary, retried; `succeeded` on attempt 4 after restart |
+| AI service **paused** (connected, not responding) | `ai_service_timeout` at 10s, temporary; `succeeded` on attempt 2 |
+| Postgres paused, Core stalled | `core_timeout` at 5s, temporary — the worker gave up before Core's own 10s bound |
+| Redis paused during a reaper cycle | `candidates: 2, reaped: 0, skipped_redis: 2`, bounded at 5s |
+| after Redis returned | next cycle `reaped: 2` — normal service resumed |
+| across all scenarios | 0 stalled events, 0 duplicate `(event_id, feature)` rows, 0 rows left `running` |
+
+## 43F.14 Limitations
+
+- **Worker SIGTERM is not live-verified.** Windows has no deliverable SIGTERM
+  to a separate process, so the drain is verified `[TEST]` against a real
+  BullMQ worker and real Redis rather than by signalling a running one. The
+  deadline logic, the "no new jobs accepted", and the "job stays recoverable"
+  properties are all covered there.
+- **No provider timeout exists**, and none is claimed. See §43F.10.
+- **The reaper's timed-out Redis lookup is released, not cancelled.** BullMQ
+  offers no cancellation for `getJobState`; the abandoned promise is given a
+  no-op handler so a late rejection cannot crash the process.
+
+---
+
+# 43G. Phase 3 Step 7 — Reliability Test Hardening
+
+## 43G.1 What Step 7 is for
+
+Not "the tests pass". The property under test is:
+
+```
+a dependency fails
+  -> the system stays correct
+  -> the recovery mechanism activates
+  -> exactly one business effect
+  -> exactly one audit row
+  -> no tenant violation
+  -> nothing stuck
+```
+
+Step 7 began with an audit of what was already covered, because duplicating an
+existing test adds runtime without adding evidence.
+
+## 43G.2 The coverage matrix
+
+| Case | Covered before Step 7 | Step 7 action |
+|---|---|---|
+| Python unavailable | `worker/src/timeouts.test.ts` | — |
+| Python timeout | `worker/src/timeouts.test.ts` | — |
+| Core unavailable / result timeout | `worker/src/timeouts.test.ts` | — |
+| retry exhaustion, exactly 6 | `worker/src/retry.integration.test.ts` | — |
+| terminal report emitted once | `worker/src/terminal-report.test.ts` | — |
+| job replacement J1 → J2 | `ai-reaper.test.ts` | — |
+| legitimate delayed job | `ai-reaper.test.ts` | — |
+| DB statement / lock timeout | `db/timeouts.test.ts` | — |
+| shutdown drain | `worker/src/shutdown.test.ts` | — |
+| tenant isolation on result | `ai.security.test.ts` | — |
+| **worker crash → stall recovery** | *nothing* | **`worker/src/stall.test.ts`** |
+| **crash → reaper closes execution** | *nothing* | **`ai.reliability.test.ts`** |
+| **Core restart mid-pipeline** | *nothing* | **`ai.reliability.test.ts`** |
+| **report unreachable → reaper handoff** | *nothing* | **`ai.reliability.test.ts`** |
+| **late success after abandonment** | partial | **`ai.reliability.test.ts`** |
+| **reaper vs report, truly concurrent** | *nothing* | **`ai.reliability.test.ts`** |
+| **two concurrent reapers** | *nothing* | **`ai.reliability.test.ts`** |
+| **concurrent duplicate `/input` claims** | *nothing* | **`ai.reliability.test.ts`** |
+| **Redis outage: no rejection, no effect** | partial | **`ai.reliability.test.ts`** |
+| **reaper cross-tenant safety** | *nothing* | **`ai.reliability.test.ts`** |
+
+## 43G.3 The two halves of a worker crash
+
+A crash breaks two things and they recover independently, so they are tested
+separately and the handoff between them is asserted:
+
+**The JOB** — `worker/src/stall.test.ts` kills a real BullMQ worker mid-job
+against real Redis. `[TEST]` a second worker re-runs it, and `[CODE]`
+`maxStalledCount: 1` means a first stall is forgiven rather than dead-lettered.
+That last point is exactly why a stall never reaches the `'failed'` handler,
+and therefore why the reaper has to exist at all.
+
+**The EXECUTION** — `ai.reliability.test.ts` claims a row through `/input`,
+never reports, and shows the reaper closing it as `abandoned` with the ticket
+untouched and exactly one audit row after two cycles.
+
+## 43G.4 Concurrency, driven rather than argued
+
+The races are fired with `Promise.all`, so the arbitration is Postgres and not
+test ordering:
+
+| Race | Result |
+|---|---|
+| reaper ‖ terminal report | one transition; `error_code` is `abandoned` **or** `retries_exhausted`, never both |
+| reaper ‖ reaper | one transition, one audit row |
+| 5 × `/input` on one event | **one** `ai_execution` row — `UNIQUE(event_id, feature)` |
+| 5 × terminal report | exactly one `applied: true` |
+| success ‖ failure | one outcome, not a merge |
+
+## 43G.5 Late success
+
+The most dangerous ordering in the design: a job the reaper wrote off finally
+succeeds. `[TEST]` the result is refused (`applied: false`), `status` stays
+`failed`, `error_code` stays `abandoned`, `result` stays NULL, and no second
+audit row appears. A subsequent `/input` answers `already_applied` rather than
+re-opening the row.
+
+## 43G.6 Security under failure
+
+Failure handling adds no bypass. `[TEST]` an unsigned reconciliation-shaped
+request is still 401; a reaper cycle that spans tenants writes only into the
+row's own product and leaves another tenant's `running` row alone; a reaped row
+is invisible under a different product scope.
+
+---
+
+# 43H. Phase 3 Step 8 — Operational Query + Safe Replay
+
+## 43H.1 The two operator questions
+
+```
+"What happened to this AI execution?"  GET  /admin/api/ai/executions
+"Can I safely run it again?"           POST /admin/api/ai/executions/:id/replay
+```
+
+**Placement.** `/admin/api` already has an authenticated support-user identity,
+role checks, product scoping and gateway routing. `/internal/*` is
+service-authenticated and never routed by the gateway, so it is the wrong home
+for a human tool; `/v1` belongs to integrating products, who must never see
+another tenant's AI history.
+
+**No new storage.** `ai_execution` is the source of truth, `event_outbox` is the
+replay mechanism, `audit_event` is the record. No table, no queue, no
+scheduler, no migration.
+
+## 43H.2 The query
+
+Roles: `super_admin`, `product_admin`, `manager`. Isolation is RLS — the route
+never writes `WHERE product_id = ...`, which is precisely the omission that
+leaks a tenant.
+
+The projection is a **whitelist**, not `SELECT *`:
+
+```
+execution_id, event_id, feature, job_id, product_id,
+ticket_id, status, attempt, error_code, created_at, completed_at
+```
+
+`result` (validated model output) and `error_message` (derived from an upstream
+body) are deliberately absent. A `SELECT *` would have started leaking them the
+day a column was added.
+
+Filters: `status`, `feature`, `ticket_id`, `event_id`, `error_code`,
+`created_from`, `created_to`. Pagination is `limit` (max **100**, default 25)
+and `offset`; ordering is `created_at DESC, id DESC` — the ULID tiebreak makes
+page boundaries stable. No new index: the table is small and none is justified.
+
+## 43H.3 Replay semantics
+
+```
+original execution   -> unchanged, forever
+new event_outbox row -> existing AI dispatcher -> BullMQ -> new ai_execution
+```
+
+A replay is an ordinary new execution. It is indistinguishable downstream and
+inherits every guarantee Steps 3–7 established.
+
+The API deliberately does **not** enqueue a BullMQ job. Keeping one dispatch
+path is what makes the watermark, the retry policy and
+`UNIQUE(event_id, feature)` apply to replays without being re-implemented.
+
+**A fresh `event_id` is the whole point.** Idempotency is anchored on
+`(event_id, feature)`, so reusing the original id would collide with the
+historical row and apply nothing.
+
+## 43H.4 Preconditions
+
+| Status | Replay | Why |
+|---|---|---|
+| `failed` (incl. `abandoned`) | **allowed** | the work never landed |
+| `succeeded` | **refused** | re-running applies the result twice — the one thing this phase exists to prevent |
+| `running` | **refused** | it may still finish; two live executions on one ticket would race |
+
+`abandoned` is a `failed` row with an `error_code`, not a separate status, so it
+needs no special case.
+
+## 43H.5 Authorization and tenant safety
+
+Replay requires `super_admin` or `product_admin` — deliberately stronger than
+the query. `[TEST]` `agent` and `manager` are refused: being able to read a
+ticket must not imply being able to re-run AI work on it.
+
+`product_id`, `ticket_id` and `feature` are read from the **execution row**,
+never from the request. A client-supplied `product_id` would be a cross-tenant
+write primitive dressed as a convenience parameter. `[TEST]` a body carrying
+another tenant's identifiers has no effect on what is created. RLS scopes the
+lookup, so a foreign execution returns zero rows and 404s — the same answer as
+"does not exist", because confirming it exists would leak the customer list.
+
+## 43H.6 ⚠️ A bug this step surfaced
+
+`emitEvent` derived `product_id` from `ctx.productScope[0]`. That is right for
+`/v1`, where a request is authenticated as exactly one product. It is **wrong
+for an admin actor**: a `super_admin` has an EMPTY scope, so the replay event
+would have been written with `product_id = NULL` — and the AI dispatcher
+requires `product_id IS NOT NULL`, so the row would have sat unpublished
+forever with no error anywhere. A `product_admin` managing several tenants
+would have got whichever product sorted first.
+
+`emitEvent` now takes an optional authoritative `productId`, which replay
+supplies from the execution row.
+
+## 43H.7 Idempotency — the decision
+
+**No new mechanism.** A double-click, a retried fetch or a proxy retry must not
+produce two replays, and the tables already know the answer: a replay is in
+flight if its outbox row is unpublished, or the execution it produced is still
+`running`.
+
+The check-then-insert is made atomic by `SELECT ... FOR UPDATE` on the original
+execution row. Without it, two concurrent requests under READ COMMITTED would
+both read "nothing in flight" and both insert. The wait is bounded by the pool's
+3s `lock_timeout` from Step 6, so contention fails fast.
+
+The unused `idempotency_key` table was considered and rejected: a stored key
+would block a *legitimate* second replay forever, whereas the in-flight guard
+gives the semantics an operator actually wants — a second click does nothing, a
+deliberate replay after the first finishes is allowed.
+
+## 43H.8 Feature narrowing in the dispatcher
+
+A replay event carries `ai_features: [<the failed feature>]`. The dispatcher
+INTERSECTS that with what the event type declares:
+
+```ts
+declared.filter((f) => requested.includes(f))
+```
+
+An intersection, not a substitution — a payload is data, and data must never
+make the dispatcher emit a feature the event type does not declare. Today
+`ticket.created -> ['noop']` makes the two identical; from Phase 9, when one
+event fans out to several features, it is the difference between re-running the
+one that failed and re-running all of them.
+
+## 43H.9 Audit
+
+One `ai.execution_replayed` row per replay, in the same transaction as the
+outbox insert, with `actor_type: support_user`, the original execution and
+event ids in `before`, and the new event id, feature and operator reason in
+`after`. `entity_id` is the ticket, so it appears in the existing ticket history
+with no endpoint change. No ticket text. `[TEST]` a refused replay writes no
+audit row — a rejected action is not an action.
+
+## 43H.10 Files
+
+| File | Change |
+|---|---|
+| `core-service/src/admin/ai-ops.routes.ts` | **new** — query + replay |
+| `core-service/src/admin/ai-ops.test.ts` | **new** — 31 tests |
+| `core-service/src/internal/ai.reliability.test.ts` | **new** — 20 tests |
+| `worker/src/stall.test.ts` | **new** — 3 tests |
+| `core-service/src/events/outbox.ts` | optional authoritative `productId` |
+| `core-service/src/events/ai-dispatcher.ts` | `featuresFor()` — replay narrowing |
+| `core-service/src/server.ts` | registers `aiOpsRoutes` |
+
+No migration. No new table, queue, scheduler, worker or dependency.
+
+---
+
+# 43I. Phase 3 — Final Architecture and Audit
+
+## 43I.1 End-to-end flow
+
+```
+POST /v1/tickets
+   └─ ticket + event_outbox row          (one transaction)
+        └─ AI dispatcher (watermarked)   outbox -> BullMQ, publish-then-mark
+             └─ ai.jobs                  6 attempts, 1/5/25/120/600s, ±20%
+                  └─ worker              HMAC; 5s Core, 10s Python, 60s lock
+                       ├─ POST /internal/ai/jobs/:e/input    claims ai_execution
+                       ├─ POST /v1/execute                   Python, no DB credential
+                       └─ POST /internal/ai/jobs/:e/result   Core validates + decides
+                            └─ ai_execution + audit_event    one transaction
+
+failure paths
+   temporary            -> BullMQ retry
+   permanent / exhausted-> worker terminal report        (once, never retried)
+   report unreachable   -> row stays running
+   crash / stall / evict-> reaper, every 60s, >45min     -> failed / abandoned
+   Redis down           -> reaper reaps NOTHING
+
+operations
+   GET  /admin/api/ai/executions          RLS-scoped, whitelisted projection
+   POST /admin/api/ai/executions/:id/replay
+        -> new event_outbox row -> the SAME dispatcher -> a NEW ai_execution
+```
+
+## 43I.2 Invariant audit
+
+| Invariant | Status | Evidence |
+|---|---|---|
+| AI predicts/extracts, IRIS decides | ✅ | worker never mutates a ticket; Core runs the validator |
+| BullMQ owns retries | ✅ | one `attempts`/`backoff`; no client retry `[TEST]` |
+| Core owns business decisions | ✅ | validation, RLS and audit are Core-side only |
+| Postgres arbitrates state | ✅ | `WHERE status='running'`, `UNIQUE(event_id,feature)`, `FOR UPDATE` |
+| AI service holds no DB credential | ✅ | boot-time refusal + `test:ai` assertion |
+| Historical executions immutable | ✅ | `[TEST]` full-row equality across a replay; DELETE revoked |
+| Replay creates a new identity | ✅ | fresh `event_id`, fresh `ai_execution` |
+| Reaper never retries | ✅ | it only reads job state `[TEST]` |
+| Timeouts create no second retry loop | ✅ | one HTTP request per timed-out call `[TEST]` |
+| Tenant scope from Core/database | ✅ | claims verified; replay reads product from the row |
+| 6 attempts, 1/5/25/120/600, ±20% | ✅ | `ai-retry.test.ts` |
+| 408/429 temporary, other 4xx permanent | ✅ | `errors.test.ts`, `timeouts.test.ts` |
+| 45-min stale threshold, Redis-safe | ✅ | §43E, re-verified `[LIVE]` |
+| 60s lock, 8s drain | ✅ | §43F |
+
+## 43I.3 Known limitations
+
+- **Worker SIGTERM is not live-verifiable on Windows** — no deliverable SIGTERM
+  to a separate process. The drain is `[TEST]`-verified against a real BullMQ
+  worker and real Redis.
+- **No provider timeout exists**, because no provider exists. Placement,
+  ordering and prerequisites are documented in `features.py` (§43F.10).
+- **The reaper's timed-out Redis lookup is released, not cancelled** — BullMQ
+  offers no cancellation for `getJobState`.
+- **`succeeded` executions cannot be replayed at all.** Deliberate for now; a
+  deliberate re-run would need an explicit flag and a duplicate-effect story,
+  which is Phase 7+ work.
+- **A replay re-runs the feature, not the original inputs.** It re-reads the
+  ticket as it is *now*. For an immutable description that is identical; if
+  ticket text becomes editable, this becomes a real distinction.
+- **One flaky test observed once** in `ai-ops.test.ts` and not reproduced in
+  nine subsequent full runs. The fixtures now assert their own state so a
+  recurrence names the real cause rather than failing three lines later.
+
+## 43I.4 Deferred (NOT implemented)
+
+Phase 9 fan-out to multiple features; a real provider and its timeout; replay
+of `succeeded`; nonce durability (Step 2 deferral, unchanged); metrics
+infrastructure; `Retry-After`; multi-instance reaper coordination.
+
+---
+
 # 45. Future Implementation Checklist
+
+
 
 ## Foundation
 
@@ -3214,4 +4234,50 @@ Deviation The Step 2 design asserted BOTH "5 attempts" and "~12.5 min". Only
           5 attempts was the explicit freeze and won; the 600s entry is
           retained and unreachable. AI_RETRY_ATTEMPTS=6 would unlock it.
 Phase     Phase 3 Step 3 - COMPLETE. Next: Step 4 (terminal failure reporting).
+```
+
+---
+
+## Change log — Phase 3 Step 3 (attempt-count correction)
+
+```text
+Date      2026-09-07
+Change    AI_RETRY_ATTEMPTS 5 -> 6.
+Reason    BullMQ retries while attemptsMade + 1 < attempts, so N delays need
+          N+1 attempts. At 5 the 600s tail was dead configuration and the
+          window was 151s, not the 751s the platform curve was sized for.
+Impact    Retry window 151s -> 751s (~12.5 min). Curve, jitter, error
+          classification, HMAC and all Phase 1/2 behaviour unchanged.
+          318 vitest + 60 pytest; 44/44 pipeline, 15/15 security,
+          43/61/9 existing smoke.
+Step 5    Maximum job lifetime is now ~14.5 min (worst case ~29.5 min with a
+          stall recovery). The Step 2 draft 45-minute reaper threshold was
+          derived from the 151s window and MUST be recomputed in Step 5.
+Phase     Phase 3 Step 3 - COMPLETE (corrected). Next: Step 4.
+```
+
+---
+
+## Change log — Phase 3 Step 4
+
+```text
+Date      2026-09-08
+Change    Terminal failure reporting. The worker now closes an execution in
+          Core when a job is genuinely dead: permanently failed, or out of
+          retries. Reuses the existing result endpoint, contract, signed
+          client, conditional update and audit transaction.
+Reason    submitAIResult was only reachable on the happy path, so exhausted
+          and permanently-failed jobs left ai_execution at 'running' forever.
+          The Step 1 audit found 13 such rows, the oldest stuck 1h54m.
+Impact    Worker-side only: 2 files created, 4 modified. Core, contracts,
+          schema, HMAC, dispatcher and the Python service unchanged.
+          371 vitest + 60 pytest; 44/44 pipeline, 15/15 security, 43/61/9 smoke.
+          No new endpoint, table, migration, dependency, queue or env var.
+Notable   The failed handler must never let a rejection escape: BullMQ does not
+          await event listeners, so an unhandled rejection would abort the
+          worker. Asserted against the process-level signal, not by inspection.
+Not done  Core outage during reporting, worker crash mid-report, and
+          stall-induced failures (which never emit 'failed') remain Step 5.
+          The Step 5 reaper threshold must be recomputed from the 751s window.
+Phase     Phase 3 Step 4 - COMPLETE. Next: Step 5 (reaper).
 ```

@@ -51,6 +51,32 @@ const Env = z.object({
   AI_DISPATCH_FROM: z.string().optional(),
   AI_DISPATCH_POLL_MS: z.coerce.number().default(1000),
   AI_DISPATCH_BATCH: z.coerce.number().default(20),
+
+  /**
+   * Phase 3 Step 5 — abandoned-execution reaper.
+   *
+   * Disabled by default, deliberately: it MUTATES business state, and the
+   * platform convention for anything that does is explicit enablement (see
+   * AI_DISPATCH_ENABLED). It is also the kill switch if it ever misbehaves.
+   */
+  AI_REAPER_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  /**
+   * How long a `running` execution may sit before it is considered abandoned.
+   *
+   * Derived, not chosen. Worst-case job lifetime is ~18 minutes: 751s of retry
+   * delays at the +20% jitter ceiling (901s), plus 6 attempts x 20s of HTTP
+   * budget, plus one stall recovery (lockDuration 30s + stalledInterval 30s).
+   * Add ~5 min of queue backlog and 1 min of poll granularity for a ~24 minute
+   * floor; 45 gives 2.5x headroom over worst-case lifetime.
+   *
+   * The min(15) floor is a guard rail, not a preference: anything below the
+   * ~18 minute worst case could reap work that is still legitimately running,
+   * so the config layer refuses it rather than trusting the operator.
+   */
+  AI_REAPER_STALE_MINUTES: z.coerce.number().int().min(15).default(45),
   /**
    * Phase 2 — service-to-service HMAC.
    *

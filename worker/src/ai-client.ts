@@ -1,7 +1,7 @@
 import { AI_FEATURES, type AIExecuteRequest, type AIResult } from '@iris/shared/types';
 import { config } from './config.js';
 import type { FetchLike } from './core-client.js';
-import { PermanentJobError, TemporaryJobError, errorForStatus } from './errors.js';
+import { PermanentJobError, TemporaryJobError, errorForStatus, isAbortError } from './errors.js';
 import { signedHeaders } from './signing.js';
 
 /**
@@ -83,9 +83,9 @@ export async function executeAI(
     });
   } catch (err) {
     // Unreachable or timed out. The ticket is unaffected either way — it was
-    // committed long before this call.
+    // committed long before this call. Both are temporary: BullMQ retries.
     throw new TemporaryJobError(
-      'ai_service_unreachable',
+      isAbortError(err) ? 'ai_service_timeout' : 'ai_service_unreachable',
       err instanceof Error ? err.message : String(err),
     );
   }
@@ -105,6 +105,21 @@ export async function executeAI(
   try {
     body = await res.json();
   } catch (err) {
+    /**
+     * The timeout is still live here. `fetch` resolves on HEADERS, so a
+     * service that answers 200 and then stalls mid-body lands in this catch
+     * with a TimeoutError — indistinguishable from bad JSON by position alone.
+     *
+     * Classifying that as `malformed_ai_response` (permanent) dead-lettered a
+     * merely slow service on attempt 1. A timeout is a dependency failure, so
+     * it goes down the temporary path and BullMQ retries it.
+     */
+    if (isAbortError(err)) {
+      throw new TemporaryJobError(
+        'ai_service_timeout',
+        `response body not received within ${config.AI_TIMEOUT_MS}ms`,
+      );
+    }
     throw new PermanentJobError(
       'malformed_ai_response',
       err instanceof Error ? err.message : 'invalid JSON',

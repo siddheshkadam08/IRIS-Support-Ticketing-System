@@ -5,7 +5,7 @@ import type {
   AIResultResponse,
 } from '@iris/shared/types';
 import { config } from './config.js';
-import { TemporaryJobError, errorForStatus } from './errors.js';
+import { TemporaryJobError, errorForStatus, isAbortError } from './errors.js';
 import { signedHeaders } from './signing.js';
 
 /**
@@ -58,7 +58,7 @@ async function post<T>(
   } catch (err) {
     // Connection refused, DNS, timeout. Core may simply be restarting.
     throw new TemporaryJobError(
-      'core_unreachable',
+      isAbortError(err) ? 'core_timeout' : 'core_unreachable',
       err instanceof Error ? err.message : String(err),
     );
   }
@@ -75,7 +75,26 @@ async function post<T>(
     throw errorForStatus(res.status, code, text);
   }
 
-  return (await res.json()) as T;
+  /**
+   * The timeout is still live while the body is read — `fetch` resolves on
+   * HEADERS. An unwrapped `res.json()` here would let a raw TimeoutError
+   * escape past the classifier; wrapping it keeps every failure from this
+   * function a typed, correctly-classified job error.
+   */
+  try {
+    return (await res.json()) as T;
+  } catch (err) {
+    if (isAbortError(err)) {
+      throw new TemporaryJobError(
+        'core_timeout',
+        `response body not received within ${config.CORE_TIMEOUT_MS}ms`,
+      );
+    }
+    throw new TemporaryJobError(
+      'core_malformed_response',
+      err instanceof Error ? err.message : 'invalid JSON',
+    );
+  }
 }
 
 /**

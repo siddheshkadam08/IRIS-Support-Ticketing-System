@@ -54,27 +54,34 @@ describe('the curve', () => {
 });
 
 describe('attempt count and the reachable window', () => {
-  it('is 5 total attempts', () => {
-    expect(AI_RETRY_ATTEMPTS).toBe(5);
+  it('is 6 total attempts', () => {
+    expect(AI_RETRY_ATTEMPTS).toBe(6);
   });
 
-  it('reaches only the first four delays — the 5th entry is unreachable', () => {
-    // BullMQ retries while `attemptsMade + 1 < attempts`, so with 5 attempts
-    // the strategy is called with 1..4 and the 5th execution is terminal.
-    // Verified against bullmq 5.81.4 source, and asserted here so raising
-    // AI_RETRY_ATTEMPTS is a deliberate act with a visible consequence.
-    expect(aiRetryWindowMs(5)).toBe((1 + 5 + 25 + 120) * 1000);
-    expect(aiRetryWindowMs(5)).toBe(151_000);
+  it('has exactly one more attempt than it has delays', () => {
+    // The invariant the correction restored: BullMQ retries while
+    // `attemptsMade + 1 < attempts`, so N delays need N+1 attempts for all of
+    // them to be reachable. At 5 attempts the 600s tail was dead config.
+    expect(AI_RETRY_ATTEMPTS).toBe(AI_RETRY_DELAYS_SECONDS.length + 1);
   });
 
-  it('a 6th attempt would unlock the 600s tail and a ~12.5 minute window', () => {
-    expect(aiRetryWindowMs(6)).toBe((1 + 5 + 25 + 120 + 600) * 1000);
-    expect(aiRetryWindowMs(6) / 60_000).toBeCloseTo(12.5, 1);
+  it('reaches EVERY delay including the 600s tail', () => {
+    expect(aiRetryWindowMs()).toBe((1 + 5 + 25 + 120 + 600) * 1000);
+    expect(aiRetryWindowMs()).toBe(751_000);
+    expect(aiRetryWindowMs() / 60_000).toBeCloseTo(12.5, 1);
+  });
+
+  it('the 600s tail is genuinely inside the window, not merely declared', () => {
+    // Guards the specific regression: at 5 attempts this difference was 0.
+    const withTail = aiRetryWindowMs(6);
+    const withoutTail = aiRetryWindowMs(5);
+    expect(withTail - withoutTail).toBe(600_000);
+    expect(withoutTail).toBe(151_000); // what the previous cut capped out at
   });
 
   it('survives a far longer outage than the schedule it replaced', () => {
-    const previousWindow = (1 + 2 + 4 + 8) * 1000; // exponential(1000)
-    expect(aiRetryWindowMs()).toBeGreaterThan(previousWindow * 9);
+    const previousWindow = (1 + 2 + 4 + 8) * 1000; // exponential(1000), ~15s
+    expect(aiRetryWindowMs()).toBeGreaterThan(previousWindow * 49);
   });
 });
 

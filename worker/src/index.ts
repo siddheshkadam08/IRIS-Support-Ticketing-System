@@ -5,6 +5,9 @@ import { config } from './config.js';
 import { logger } from './logger.js';
 import { handleAIJob } from './consumers/ai.consumer.js';
 import { isPermanent } from './errors.js';
+import { reportTerminalFailure } from './terminal-report.js';
+import { drainWorker } from './shutdown.js';
+import { LOCK_DURATION_MS } from './limits.js';
 
 /**
  * The worker process. One queue, one handler, one retry policy.
@@ -33,6 +36,7 @@ const worker = new Worker<AIJob>(
   {
     connection,
     concurrency: config.AI_WORKER_CONCURRENCY,
+    lockDuration: LOCK_DURATION_MS,
     /**
      * The retry curve. BullMQ calls this when a job fails and is eligible for
      * another attempt, passing the 1-based number of the attempt that just
@@ -51,6 +55,16 @@ const worker = new Worker<AIJob>(
   },
 );
 
+/**
+ * BullMQ does NOT await event listeners (`this.emit('failed', ...)` is a plain
+ * EventEmitter call), so a rejected promise here would be an unhandled
+ * rejection — which Node aborts the process on by default.
+ *
+ * The listener is therefore `void`-returning and delegates to a function that
+ * is contractually incapable of throwing. `void` on the call makes the
+ * floating promise deliberate rather than accidental, and the extra `.catch`
+ * is belt-and-braces for a bug inside the reporter itself.
+ */
 worker.on('failed', (job, err) => {
   // "Which attempt failed, was it worth retrying, and when does the next one
   // run" are the first three debugging questions. Log the classification and
@@ -61,9 +75,9 @@ worker.on('failed', (job, err) => {
    *   processor      : 0 on the first run  -> attempt = attemptsMade + 1
    *   'failed' event : already incremented -> attempt = attemptsMade
    *
-   * Verified live: with 5 executions this handler saw 1,2,3,4,5 while
-   * ai_execution recorded 1..5 from the processor. Using +1 here logged
-   * "attempt 6" and declared retries exhausted one step early.
+   * Verified live: with N executions this handler sees 1..N while the
+   * processor sees 0..N-1. Using +1 here logged one attempt too many and
+   * declared retries exhausted a step early.
    */
   const attempt = job?.attemptsMade ?? 0;
   const permanent = isPermanent(err);
@@ -89,6 +103,22 @@ worker.on('failed', (job, err) => {
         ? 'AI job failed — will retry'
         : 'AI job failed — retries exhausted',
   );
+
+  /**
+   * Phase 3 Step 4: close the execution in Core when the job is genuinely
+   * dead. Non-final temporary failures fall through — BullMQ will retry them
+   * and the row must stay `running`.
+   *
+   * reportTerminalFailure never throws and never retries; see its contract.
+   */
+  void reportTerminalFailure(job, err).catch((unexpected: unknown) => {
+    // Unreachable by contract. If it ever fires, the reporter has a bug — say
+    // so loudly rather than letting the process die on an unhandled rejection.
+    logger.error(
+      { event_id: job?.data?.event_id, err: String(unexpected) },
+      'terminal failure reporter threw — this should be impossible',
+    );
+  });
 });
 
 worker.on('error', (err) => logger.error({ err: err.message }, 'worker error'));
@@ -110,13 +140,38 @@ function redacted(url: string): string {
 }
 
 /**
- * Stop taking new jobs, let in-flight ones finish, then close. A killed worker
- * must leave every job re-runnable, which the idempotency design already
- * guarantees — this just avoids creating unnecessary retries.
+ * Stop taking new jobs, let in-flight ones finish, then close — WITH A HARD
+ * DEADLINE.
+ *
+ * `[CODE]` `worker.close()` calls `whenCurrentJobsFinished(false)`
+ * (bullmq worker.js:803) and waits for in-flight jobs indefinitely. A worst-
+ * case attempt is ~20s, longer than any sane termination grace period, so an
+ * unbounded close means the orchestrator SIGKILLs us mid-write instead.
+ *
+ * Exiting on our own terms is strictly better, because the unfinished job is
+ * already safe: it keeps its lock, the lock expires after LOCK_DURATION_MS,
+ * BullMQ's stalled check re-runs it, and `UNIQUE(event_id, feature)` makes the
+ * re-run idempotent. This adds NO recovery mechanism — it hands the job back
+ * to the one that already exists.
+ *
+ * The deadline logic lives in shutdown.ts so it can be tested against a real
+ * BullMQ worker without importing this module's side effects.
  */
+let shuttingDown = false;
 const shutdown = async (signal: string) => {
-  logger.info({ signal }, 'shutting down');
-  await worker.close();
+  if (shuttingDown) return; // a second SIGTERM must not restart the clock
+  shuttingDown = true;
+
+  logger.info({ signal, drain_ms: config.AI_WORKER_DRAIN_MS }, 'shutting down');
+  const { drained, elapsedMs } = await drainWorker(worker, config.AI_WORKER_DRAIN_MS);
+
+  logger.info(
+    { signal, drained, elapsed_ms: elapsedMs },
+    drained
+      ? 'in-flight jobs finished — clean shutdown'
+      : 'drain deadline reached — exiting; BullMQ stall recovery owns the unfinished job',
+  );
+
   connection.disconnect();
   process.exit(0);
 };

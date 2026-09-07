@@ -6,9 +6,12 @@ import {
   AI_RETRY_ATTEMPTS,
   AI_RETRY_DELAYS_SECONDS,
   aiRetryDelayMs,
+  type AIJob,
 } from '@iris/shared/types';
 import { config } from './config.js';
+import type { FetchLike } from './core-client.js';
 import { PermanentJobError, TemporaryJobError } from './errors.js';
+import { RETRIES_EXHAUSTED, reportTerminalFailure } from './terminal-report.js';
 
 /**
  * Retry behaviour against REAL BullMQ and REAL Redis.
@@ -18,8 +21,8 @@ import { PermanentJobError, TemporaryJobError } from './errors.js';
  * resolves to the worker's registered strategy, and that PermanentJobError is
  * genuinely terminal to BullMQ rather than merely named that way.
  *
- * TIMING IS SCALED. The production curve is 1s/5s/25s/120s — 151 seconds of
- * waiting, which is not a test. These suites register the SAME aiRetryDelayMs
+ * TIMING IS SCALED. The production curve is 1s/5s/25s/120s/600s — 751 seconds
+ * of waiting, which is not a test. These suites register the SAME aiRetryDelayMs
  * function, divided down: /1000 where only the attempt COUNT matters, and /10
  * in the curve test, where the gaps must clear BullMQ's delayed-job scheduling
  * granularity to be observable at all. The SHAPE and RATIOS are the production
@@ -109,7 +112,7 @@ describe('a temporary failure is retried', () => {
 
     // attemptsMade is 0 on the first execution — the basis for
     // `handleAIJob({ attempt: job.attemptsMade + 1 })`.
-    expect(attempts).toEqual([0, 1, 2, 3, 4]);
+    expect(attempts).toEqual([0, 1, 2, 3, 4, 5]);
 
     const failed = await q.getFailedCount();
     expect(failed, 'ends in the failed set, not lost').toBe(1);
@@ -194,8 +197,10 @@ describe("attemptsMade means different things in different places", () => {
     await waitFor(() => inFailedEvent.length >= AI_RETRY_ATTEMPTS);
     await new Promise((r) => setTimeout(r, 300));
 
-    expect(inProcessor, 'processor: 0-based').toEqual([0, 1, 2, 3, 4]);
-    expect(inFailedEvent, 'failed event: already incremented').toEqual([1, 2, 3, 4, 5]);
+    expect(inProcessor, 'processor: 0-based').toEqual([0, 1, 2, 3, 4, 5]);
+    expect(inFailedEvent, 'failed event: already incremented').toEqual([1, 2, 3, 4, 5, 6]);
+    // Exhaustion is attempt 6, NOT a phantom 7th.
+    expect(Math.max(...inFailedEvent)).toBe(AI_RETRY_ATTEMPTS);
 
     // Therefore: processor uses +1, the failed handler must NOT.
     expect(inProcessor.map((a) => a + 1)).toEqual(inFailedEvent);
@@ -203,9 +208,10 @@ describe("attemptsMade means different things in different places", () => {
 });
 
 describe('the custom strategy is actually consulted', () => {
-  it('BullMQ calls it with 1,2,3,4 for a 5-attempt job', async () => {
+  it('BullMQ calls it with 1,2,3,4,5 for a 6-attempt job — the whole curve', async () => {
     // Confirms our reading of `Backoffs.calculate(..., attemptsMade + 1, ...)`
-    // and that the 5th delay in the curve is unreachable at 5 attempts.
+    // and, since the correction, that EVERY delay bucket including the 600s
+    // tail is actually reached. At 5 attempts this stopped at 4.
     const q = makeQueue('strategy-args');
     const seen: number[] = [];
 
@@ -226,11 +232,13 @@ describe('the custom strategy is actually consulted', () => {
     await waitFor(() => seen.length >= AI_RETRY_ATTEMPTS - 1);
     await new Promise((r) => setTimeout(r, 400));
 
-    expect(seen).toEqual([1, 2, 3, 4]);
-    expect(seen).not.toContain(5);
+    expect(seen).toEqual([1, 2, 3, 4, 5]);
+    // The 6th execution is terminal, so the strategy is never asked about it.
+    expect(seen).not.toContain(6);
+    expect(seen.length, 'one delay per curve entry').toBe(AI_RETRY_DELAYS_SECONDS.length);
     expect(
-      AI_RETRY_DELAYS_SECONDS[4],
-      'the 600s entry exists but is unreachable at 5 attempts',
+      AI_RETRY_DELAYS_SECONDS[Math.max(...seen) - 1],
+      'the final bucket reached is the 600s tail',
     ).toBe(600);
   });
 
@@ -317,5 +325,217 @@ describe('there is no second retry loop', () => {
 
     expect(runs, 'a success must never be re-executed').toBe(1);
     expect(await q.getCompletedCount()).toBe(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 3 Step 4 — terminal reporting against REAL BullMQ.
+//
+// The unit tests prove the decision function; these prove the WIRING: that a
+// failed handler shaped like worker/src/index.ts reports exactly once across a
+// real retry lifecycle, and not at all on the attempts BullMQ still intends to
+// retry. Core is stubbed at the transport, as everywhere else in this file.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('terminal reporting across a real retry lifecycle', () => {
+  const AI_JOB: AIJob = {
+    job_id: 'aij_TERM',
+    event_id: 'evt_TERM',
+    feature: 'noop',
+    product_id: 'prod_carbon',
+    ticket_id: 'tkt_TERM',
+    correlation_id: 'req_TERM',
+    requested_at: '2026-09-07T10:00:00.000Z',
+    attempt: 1,
+  };
+
+  const okResponse = () =>
+    new Response(
+      JSON.stringify({
+        execution_id: 'aix_TERM',
+        status: 'failed',
+        applied: true,
+        ticket_updated: false,
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    );
+
+  /** Mirrors worker/src/index.ts: floating, never awaited, never throws. */
+  function attachTerminalReporting(w: Worker, coreFetch: FetchLike) {
+    w.on('failed', (job, err) => {
+      void reportTerminalFailure(
+        job as unknown as Parameters<typeof reportTerminalFailure>[0],
+        err,
+        coreFetch,
+      ).catch(() => undefined);
+    });
+  }
+
+  function coreRecorder() {
+    const calls: Array<Record<string, unknown>> = [];
+    const fetchImpl: FetchLike = async (_url, init) => {
+      calls.push(JSON.parse(String(init.body)));
+      return okResponse();
+    };
+    return { calls, fetchImpl };
+  }
+
+  it('reports EXACTLY ONCE after six temporary failures', async () => {
+    const q = makeQueue('terminal-exhaust');
+    const core = coreRecorder();
+    let runs = 0;
+
+    const w = makeWorker(
+      q.name,
+      async () => {
+        runs++;
+        throw new TemporaryJobError('ai_service_unreachable', 'injected');
+      },
+      { backoffStrategy: scaledStrategy },
+    );
+    attachTerminalReporting(w, core.fetchImpl);
+
+    await q.add('noop', AI_JOB, {
+      attempts: AI_RETRY_ATTEMPTS,
+      backoff: { type: AI_BACKOFF_TYPE },
+    });
+
+    await waitFor(() => core.calls.length >= 1);
+    await new Promise((r) => setTimeout(r, 500));
+
+    expect(runs, 'six executions').toBe(AI_RETRY_ATTEMPTS);
+    expect(core.calls, 'one report, not one per attempt').toHaveLength(1);
+
+    const body = core.calls[0]! as { attempt: number; result: { error: { code: string } } };
+    expect(body.attempt, 'the final attempt, not a phantom 7th').toBe(AI_RETRY_ATTEMPTS);
+    expect(body.result.error.code).toBe(RETRIES_EXHAUSTED);
+  });
+
+  it('reports immediately on a permanent failure, after one execution', async () => {
+    const q = makeQueue('terminal-permanent');
+    const core = coreRecorder();
+    let runs = 0;
+
+    const w = makeWorker(
+      q.name,
+      async () => {
+        runs++;
+        throw new PermanentJobError('malformed_ai_response', 'data is not an object');
+      },
+      { backoffStrategy: scaledStrategy },
+    );
+    attachTerminalReporting(w, core.fetchImpl);
+
+    await q.add('noop', AI_JOB, {
+      attempts: AI_RETRY_ATTEMPTS,
+      backoff: { type: AI_BACKOFF_TYPE },
+    });
+
+    await waitFor(() => core.calls.length >= 1);
+    await new Promise((r) => setTimeout(r, 600));
+
+    expect(runs).toBe(1);
+    expect(core.calls).toHaveLength(1);
+
+    const body = core.calls[0]! as { attempt: number; result: { error: { code: string } } };
+    expect(body.attempt).toBe(1);
+    expect(body.result.error.code, 'the permanent code, not retries_exhausted').toBe(
+      'malformed_ai_response',
+    );
+  });
+
+  it('reports NOTHING when the job succeeds', async () => {
+    const q = makeQueue('terminal-success');
+    const core = coreRecorder();
+    let runs = 0;
+
+    const w = makeWorker(
+      q.name,
+      async () => {
+        runs++;
+        return { ok: true };
+      },
+      { backoffStrategy: scaledStrategy },
+    );
+    attachTerminalReporting(w, core.fetchImpl);
+
+    await q.add('noop', AI_JOB, {
+      attempts: AI_RETRY_ATTEMPTS,
+      backoff: { type: AI_BACKOFF_TYPE },
+    });
+
+    await waitFor(() => runs >= 1);
+    await new Promise((r) => setTimeout(r, 500));
+
+    expect(runs).toBe(1);
+    expect(core.calls, 'a success must never be reported as terminal').toHaveLength(0);
+  });
+
+  it('reports nothing while attempts remain — checked mid-flight', async () => {
+    // A job with more attempts than we let it use: the reporter must stay
+    // silent for every attempt BullMQ still intends to retry.
+    const q = makeQueue('terminal-midflight');
+    const core = coreRecorder();
+    let runs = 0;
+
+    const w = makeWorker(
+      q.name,
+      async () => {
+        runs++;
+        throw new TemporaryJobError('ai_service_unreachable', 'injected');
+      },
+      { backoffStrategy: () => 40 },
+    );
+    attachTerminalReporting(w, core.fetchImpl);
+
+    await q.add('noop', AI_JOB, { attempts: 20, backoff: { type: AI_BACKOFF_TYPE } });
+
+    await waitFor(() => runs >= 4);
+    expect(core.calls, 'four failures, none terminal').toHaveLength(0);
+
+    await w.close();
+  });
+
+  it('a Core outage during reporting does not crash the worker', async () => {
+    const q = makeQueue('terminal-core-down');
+    let reports = 0;
+    let runs = 0;
+
+    const failing: FetchLike = async () => {
+      reports++;
+      throw new Error('ECONNREFUSED');
+    };
+
+    const w = makeWorker(
+      q.name,
+      async () => {
+        runs++;
+        throw new TemporaryJobError('ai_service_unreachable', 'injected');
+      },
+      { backoffStrategy: scaledStrategy },
+    );
+    attachTerminalReporting(w, failing);
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (r: unknown) => unhandled.push(r);
+    process.on('unhandledRejection', onUnhandled);
+
+    try {
+      await q.add('noop', AI_JOB, {
+        attempts: AI_RETRY_ATTEMPTS,
+        backoff: { type: AI_BACKOFF_TYPE },
+      });
+      await waitFor(() => reports >= 1);
+      await new Promise((r) => setTimeout(r, 600));
+
+      expect(runs).toBe(AI_RETRY_ATTEMPTS);
+      expect(reports, 'ONE attempt at the report — no retry loop').toBe(1);
+      expect(unhandled, 'no unhandled rejection').toEqual([]);
+      expect(await q.getFailedCount(), 'the job is not re-enqueued').toBe(1);
+      expect(await q.getWaitingCount()).toBe(0);
+      expect(await q.getDelayedCount()).toBe(0);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 });

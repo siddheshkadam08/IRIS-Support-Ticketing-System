@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://support.iris.example/contracts/webhooks/webhook-event.schema.json",
+  "title": "IRIS webhook event",
+  "description": "The envelope of every webhook and access callback the platform sends. Signed with HMAC-SHA256 as `X-IRIS-Signature: t=<unix>,v1=<hex>` over `{t}.{raw_body}`. Verify against the RAW body bytes BEFORE parsing — re-serialising changes whitespace and key order and every signature then fails. Delivery is at-least-once, so deduplicate on `event_id`.",
+
+  "type": "object",
+  "required": ["event_id", "event", "api_version", "occurred_at"],
+  "additionalProperties": true,
+
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "description": "Unique per event. DEDUPLICATE ON THIS — you will occasionally receive a duplicate.",
+      "examples": ["evt_01JQZ8X4M2"]
+    },
+    "event": { "$ref": "#/$defs/eventType" },
+    "api_version": { "type": "string", "const": "v1" },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Sort on this if strict ordering matters — a retry can reorder across tickets."
+    },
+    "product_id": { "type": "string" },
+    "grant_id": { "type": "string", "description": "Present on access.* events." },
+    "product_grant_ref": {
+      "type": ["string", "null"],
+      "description": "Your own handle for the grant, quoted back to you on revoke."
+    },
+    "data": { "type": "object", "additionalProperties": true }
+  },
+
+  "allOf": [
+    {
+      "description": "Access callbacks must identify which grant they concern.",
+      "if": {
+        "properties": {
+          "event": { "enum": ["access.grant_requested", "access.revoke_requested"] }
+        },
+        "required": ["event"]
+      },
+      "then": { "required": ["grant_id", "data"] }
+    },
+    {
+      "description": "Ticket events must identify the ticket.",
+      "if": {
+        "properties": { "event": { "pattern": "^ticket\\." } },
+        "required": ["event"]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["ticket_id"],
+            "properties": { "ticket_id": { "type": "string" } }
+          }
+        },
+        "required": ["data"]
+      }
+    }
+  ],
+
+  "$defs": {
+    "eventType": {
+      "type": "string",
+      "description": "Do NOT fail on an unrecognised event type — log and skip. New types are an additive change within v1.",
+      "enum": [
+        "ticket.created",
+        "ticket.classified",
+        "ticket.assigned",
+        "ticket.in_progress",
+        "ticket.waiting_on_raiser",
+        "ticket.comment_added",
+        "ticket.resolved",
+        "ticket.closed",
+        "ticket.reopened",
+        "ticket.rated",
+        "ticket.sla_breached",
+        "access.grant_requested",
+        "access.revoke_requested",
+        "access.activated",
+        "access.revoked",
+        "access.revoke_failed"
+      ]
+    },
+
+    "accessGrantRequestData": {
+      "title": "access.grant_requested → data",
+      "type": "object",
+      "required": ["ticket_id", "support_user_id"],
+      "properties": {
+        "ticket_id": { "type": "string" },
+        "support_user_id": {
+          "type": "string",
+          "description": "The support engineer the grant is for. Bind access to this identity."
+        },
+        "resource_ref": {
+          "type": ["string", "null"],
+          "description": "The scope YOU chose at mint time. The platform never invents one."
+        }
+      }
+    },
+
+    "accessRevokeRequestData": {
+      "title": "access.revoke_requested → data",
+      "type": "object",
+      "required": ["ticket_id"],
+      "properties": {
+        "ticket_id": { "type": "string" },
+        "reason": { "type": "string", "examples": ["resolved", "closed"] }
+      }
+    },
+
+    "grantResponse": {
+      "title": "Your 200 response to access.grant_requested",
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string", "enum": ["granted", "denied"] },
+        "product_grant_ref": {
+          "type": "string",
+          "description": "Your own handle. The platform stores it and quotes it back on revoke."
+        },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "reason": { "type": "string", "description": "Why, when status is denied." }
+      }
+    },
+
+    "revokeResponse": {
+      "title": "Your 200 response to access.revoke_requested",
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string", "enum": ["revoked"] }
+      }
+    }
+  }
+}

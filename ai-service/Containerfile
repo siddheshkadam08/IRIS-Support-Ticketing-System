@@ -1,0 +1,42 @@
+# IRIS AI service.
+#
+# Internal only. Never publicly bound, never given a database credential.
+#
+# Build context is the REPO ROOT, because Phase 2 verifies request signatures
+# with shared/hmac-utils/py — the same package the TypeScript side mirrors and
+# the same vectors both are tested against. Vendoring a copy here is exactly
+# how signer and verifier drift apart, so it is copied from source instead.
+#
+#   podman build -f ai-service/Containerfile -t localhost/iris-ai-service .
+FROM docker.io/library/python:3.12-slim
+
+WORKDIR /app
+
+# Dependencies first so a source change does not reinstall the world.
+COPY ai-service/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY ai-service/main.py ./
+COPY ai-service/src ./src
+# The shared HMAC implementation. Pure stdlib (hmac/hashlib) — no dependency.
+COPY shared/hmac-utils/py/iris_hmac ./iris_hmac
+
+# Marks this as the service's OWN environment, so tests/test_isolation.py runs
+# its "no database driver is even installed" assertion here. On a developer
+# machine that check is meaningless — one global interpreter is shared with
+# other projects — so it is skipped there and enforced here.
+ENV AI_SERVICE_ISOLATED_ENV=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# NO DATABASE URL IS SET, DELIBERATELY.
+# ADR-007 wants the ABSENCE, not a wrong value: src/config.py refuses to boot if
+# one is present, so a mistake kills the container instead of quietly opening a
+# second, unpoliced path to the data.
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=5 \
+  CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:5000/health').read()"
+
+CMD ["python", "main.py"]

@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://support.iris.example/contracts/ai/ai-contracts.schema.json",
+  "title": "IRIS AI pipeline contracts",
+  "description": "Every payload that crosses a process boundary in the AI pipeline. ONE file with internal $defs and no external $ref, so both AJV (TypeScript) and jsonschema (Python) load it with no resolver plumbing and it can never half-load. The TypeScript mirror is shared/types/ai.ts; the Python mirror is ai-service/src/api/schemas.py. Both are validated against THIS file by their own test suites, so the three cannot drift.",
+
+  "$defs": {
+    "ai_feature": {
+      "description": "Every capability that shares the single ai.jobs queue. Core accepts only the subset in SUPPORTED_AI_FEATURES (Phase 1: noop).",
+      "type": "string",
+      "enum": ["noop", "classification", "sentiment", "keywords", "summary", "rag"]
+    },
+
+    "ai_job": {
+      "description": "The BullMQ payload. Identity and context ONLY — never the ticket. job_id changes on every re-dispatch; event_id never does.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "event_id",
+        "feature",
+        "product_id",
+        "ticket_id",
+        "correlation_id",
+        "requested_at",
+        "attempt"
+      ],
+      "properties": {
+        "job_id": { "type": "string", "minLength": 1, "examples": ["aij_01JQZ8X5N3"] },
+        "event_id": { "type": "string", "minLength": 1, "examples": ["evt_01JQZ8X4M2"] },
+        "feature": { "$ref": "#/$defs/ai_feature" },
+        "product_id": { "type": "string", "minLength": 1 },
+        "ticket_id": { "type": "string", "minLength": 1 },
+        "correlation_id": { "type": "string", "minLength": 1 },
+        "requested_at": { "type": "string", "format": "date-time" },
+        "attempt": { "type": "integer", "minimum": 1 }
+      }
+    },
+
+    "ai_job_claims": {
+      "description": "What the worker asserts about the job it holds. Core VERIFIES these against its own outbox row and never uses them as lookup keys — the only key is the eventId in the URL path.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "feature",
+        "attempt",
+        "correlation_id",
+        "claimed_product_id",
+        "claimed_ticket_id"
+      ],
+      "properties": {
+        "job_id": { "type": "string", "minLength": 1 },
+        "feature": { "$ref": "#/$defs/ai_feature" },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "correlation_id": { "type": "string", "minLength": 1 },
+        "claimed_product_id": { "type": "string", "minLength": 1 },
+        "claimed_ticket_id": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "ai_input_request": { "$ref": "#/$defs/ai_job_claims" },
+
+    "ai_ticket_input": {
+      "description": "The ONLY ticket fields that may cross into the AI pipeline. Adding a property here is a data-boundary decision, not a refactor.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ticket_id", "subject", "description"],
+      "properties": {
+        "ticket_id": { "type": "string", "minLength": 1 },
+        "subject": { "type": ["string", "null"] },
+        "description": { "type": "string" }
+      }
+    },
+
+    "ai_taxonomy": {
+      "description": "The product's label set, supplied by Core so the taxonomy is never duplicated inside Python.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["categories", "severities"],
+      "properties": {
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["value", "label"],
+            "properties": {
+              "value": { "type": "string" },
+              "label": { "type": "string" }
+            }
+          }
+        },
+        "severities": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "ai_thresholds": {
+      "description": "product.config.ai_thresholds merged over the ADR-005 defaults. Config, not code — a per-product knob that needs a deploy is not a knob.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["auto_route_p1", "auto_route_margin", "triage_floor"],
+      "properties": {
+        "auto_route_p1": { "type": "number", "minimum": 0, "maximum": 1 },
+        "auto_route_margin": { "type": "number", "minimum": 0, "maximum": 1 },
+        "triage_floor": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+
+    "ai_input_response": {
+      "description": "Discriminated on status. The already_applied arm structurally cannot carry ticket data, so a caller that ignores the flag still has nothing to leak.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "feature", "correlation_id", "ticket", "taxonomy", "thresholds"],
+          "properties": {
+            "status": { "const": "ready" },
+            "feature": { "$ref": "#/$defs/ai_feature" },
+            "correlation_id": { "type": "string", "minLength": 1 },
+            "ticket": { "$ref": "#/$defs/ai_ticket_input" },
+            "taxonomy": { "$ref": "#/$defs/ai_taxonomy" },
+            "thresholds": { "$ref": "#/$defs/ai_thresholds" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "feature",
+            "correlation_id",
+            "execution_id",
+            "execution_status"
+          ],
+          "properties": {
+            "status": { "const": "already_applied" },
+            "feature": { "$ref": "#/$defs/ai_feature" },
+            "correlation_id": { "type": "string", "minLength": 1 },
+            "execution_id": { "type": "string", "minLength": 1 },
+            "execution_status": { "type": "string", "enum": ["succeeded", "failed"] }
+          }
+        }
+      ]
+    },
+
+    "ai_execute_request": {
+      "description": "THE data boundary: exactly what crosses into the Python AI service. No product_id, no tenant id, no raiser identity, no secret, no token. additionalProperties:false on this and on `input` is what turns that rule into a failing test rather than a review comment.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["feature", "request_id", "input"],
+      "properties": {
+        "feature": { "$ref": "#/$defs/ai_feature" },
+        "request_id": { "type": "string", "minLength": 1 },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["subject", "description"],
+          "properties": {
+            "subject": { "type": ["string", "null"] },
+            "description": { "type": "string" },
+            "taxonomy": { "$ref": "#/$defs/ai_taxonomy" },
+            "thresholds": { "$ref": "#/$defs/ai_thresholds" }
+          }
+        }
+      }
+    },
+
+    "ai_error": {
+      "description": "kind alone carries retryability. temporary => the same call might succeed later (BullMQ retries). permanent => it will not (fail fast).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "code", "message"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["temporary", "permanent"] },
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string" }
+      }
+    },
+
+    "ai_result": {
+      "description": "What the model produced. UNTRUSTED until Core's per-feature validator accepts it — `data` is an open object here precisely because this schema cannot know whether the content is sane.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["feature", "status", "data"],
+      "properties": {
+        "feature": { "$ref": "#/$defs/ai_feature" },
+        "status": { "type": "string", "enum": ["succeeded", "failed"] },
+        "data": { "type": "object", "additionalProperties": true },
+        "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "provider": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "model_version": { "type": ["string", "null"] },
+        "prompt_version": { "type": ["string", "null"] },
+        "latency_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "fallback_used": { "type": "boolean" },
+        "error": {
+          "oneOf": [{ "$ref": "#/$defs/ai_error" }, { "type": "null" }]
+        }
+      }
+    },
+
+    "ai_result_request": {
+      "description": "ai_job_claims plus the result. The claims are verified exactly as they are on the input endpoint — one verification function, so the two paths cannot drift.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "feature",
+        "attempt",
+        "correlation_id",
+        "claimed_product_id",
+        "claimed_ticket_id",
+        "result"
+      ],
+      "properties": {
+        "job_id": { "type": "string", "minLength": 1 },
+        "feature": { "$ref": "#/$defs/ai_feature" },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "correlation_id": { "type": "string", "minLength": 1 },
+        "claimed_product_id": { "type": "string", "minLength": 1 },
+        "claimed_ticket_id": { "type": "string", "minLength": 1 },
+        "result": { "$ref": "#/$defs/ai_result" }
+      }
+    },
+
+    "ai_result_response": {
+      "description": "applied:false is the observable proof of idempotency — a duplicate wrote nothing.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["execution_id", "status", "applied", "ticket_updated"],
+      "properties": {
+        "execution_id": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "enum": ["succeeded", "failed"] },
+        "applied": { "type": "boolean" },
+        "ticket_updated": { "type": "boolean" }
+      }
+    },
+
+    "noop_data": {
+      "description": "The only `data` shape Phase 1 accepts. Trivial on purpose — it gives Core's validation boundary something real to reject.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "received_chars"],
+      "properties": {
+        "ok": { "const": true },
+        "received_chars": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

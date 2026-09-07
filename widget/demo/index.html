@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IRIS Support Widget — test page</title>
+    <style>
+      :root { --ink:#0f172a; --muted:#64748b; --line:#e2e8f0; --primary:#1d4ed8; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; min-height: 100vh; background: #f8fafc; color: var(--ink);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        display: flex; flex-direction: column;
+      }
+      main { flex: 1; max-width: 760px; margin: 0 auto; padding: 56px 24px 40px; width: 100%; }
+      h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -.3px; }
+      .lede { color: var(--muted); font-size: 15px; line-height: 1.6; margin: 0 0 28px; }
+      .card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; margin-bottom: 16px; }
+      .card h2 { font-size: 14px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+      pre { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 9px;
+            font-size: 12.5px; overflow-x: auto; margin: 0; line-height: 1.55; }
+      .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+      button { border: 1px solid var(--line); background: #fff; border-radius: 8px;
+               padding: 9px 14px; font-size: 13.5px; cursor: pointer; font-family: inherit; }
+      button:hover { border-color: var(--primary); color: var(--primary); }
+      button.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+      .status { font-size: 13px; color: var(--muted); margin-top: 10px; min-height: 19px; }
+      .ok { color: #047857; } .err { color: #b91c1c; }
+      ul { margin: 0; padding-left: 20px; font-size: 13.5px; line-height: 1.9; color: #334155; }
+      footer { border-top: 1px solid var(--line); padding: 18px 24px; text-align: center;
+               font-size: 12px; color: #94a3b8; background: #fff; letter-spacing: .2px; }
+      code { background: #f1f5f9; padding: 1px 6px; border-radius: 4px; font-size: 12.5px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Support widget — test page</h1>
+      <p class="lede">
+        A deliberately plain page whose only job is to host the widget so it can be verified.
+        The blue bubble is bottom-right. Everything the widget shows — branding, categories,
+        suggestions, which tiles appear — comes from server-side product config, not from this page.
+      </p>
+
+      <div class="card">
+        <h2>The entire integration</h2>
+        <pre>&lt;script src="http://localhost:4000/widget.js"
+        data-product-key="pub_live_carbon_8f2a"
+        defer&gt;&lt;/script&gt;</pre>
+      </div>
+
+      <div class="card">
+        <h2>Identity (SSO)</h2>
+        <p style="font-size:13.5px;color:#334155;line-height:1.6;margin:0 0 12px">
+          In production <strong>your backend</strong> mints a short-lived JWT and passes it as
+          <code>data-identity-token</code>. This page calls the gateway's dev-only minting endpoint
+          instead, so the SSO path can be exercised without a backend.
+        </p>
+        <div class="row">
+          <button class="primary" id="signin">Sign in as Siddhesh</button>
+          <button id="signout">Sign out (anonymous)</button>
+          <button id="open">Open widget</button>
+        </div>
+        <div class="status" id="status">Not signed in — the widget will greet you anonymously.</div>
+      </div>
+
+      <div class="card">
+        <h2>What to check</h2>
+        <ul>
+          <li>All eight tiles render, four across, two rows</li>
+          <li><strong>Ask a Question</strong> returns real answers from the knowledge base</li>
+          <li><strong>Search Docs</strong> finds articles; open one and vote helpful</li>
+          <li><strong>Create a Ticket</strong> returns a reference like <code>CARB-1041</code></li>
+          <li><strong>My Tickets</strong> lists only your own tickets</li>
+          <li><strong>Live Chat</strong> says it will convert to a ticket, and does</li>
+          <li>The footer reads <strong>Powered by Elevate - X.</strong> on every view</li>
+        </ul>
+      </div>
+    </main>
+
+    <footer>Powered by Elevate - X.</footer>
+
+    <script>
+      const GATEWAY = 'http://localhost:4000';
+      const KEY = 'pub_live_carbon_8f2a';
+      const statusEl = document.getElementById('status');
+
+      const say = (msg, cls) => {
+        statusEl.textContent = msg;
+        statusEl.className = 'status ' + (cls || '');
+      };
+
+      document.getElementById('signin').onclick = async () => {
+        say('Minting identity token…');
+        try {
+          const res = await fetch(GATEWAY + '/dev/identity-token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              publishable_key: KEY,
+              sub: 'usr_demo_1',
+              product_tenant_id: 'acme-corp',
+              name: 'Siddhesh',
+              email: 'siddhesh@acme.example',
+            }),
+          });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const data = await res.json();
+          window.IrisSupport.setIdentity(data.identity_token);
+          window.IrisSupport.open();
+          say('Signed in as Siddhesh — the widget greets you by name.', 'ok');
+        } catch (err) {
+          say('Could not mint a token: ' + err.message + '. Is the gateway running on :4000?', 'err');
+        }
+      };
+
+      document.getElementById('signout').onclick = () => {
+        location.reload();
+      };
+
+      document.getElementById('open').onclick = () => window.IrisSupport?.open();
+    </script>
+
+    <!-- The integration itself. One tag. -->
+    <script
+      src="http://localhost:4000/widget.js"
+      data-product-key="pub_live_carbon_8f2a"
+      defer
+    ></script>
+  </body>
+</html>

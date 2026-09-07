@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://support.iris.example/contracts/events/outbox-event.schema.json",
+  "title": "IRIS internal outbox event",
+  "description": "A row in `event_outbox`. INTERNAL — not part of the integration contract and may change without a version bump. Written in the SAME transaction as the state change it describes: never enqueue after COMMIT, because a lost access.revoke means access outlives its ticket, silently.",
+
+  "type": "object",
+  "required": ["event_id", "aggregate", "event_type", "payload"],
+  "additionalProperties": false,
+
+  "properties": {
+    "event_id": { "type": "string", "examples": ["evt_01JQZ8X4M2"] },
+    "product_id": { "type": ["string", "null"] },
+    "aggregate": {
+      "type": "string",
+      "enum": ["ticket", "access_grant", "support_user", "product"],
+      "description": "Which entity kind the event concerns."
+    },
+    "aggregate_id": { "type": ["string", "null"] },
+    "event_type": { "type": "string" },
+    "payload": { "type": "object", "additionalProperties": true },
+    "request_id": {
+      "type": ["string", "null"],
+      "description": "Correlates the whole cross-service trace, and is stamped onto audit_event."
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "published_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Null until a consumer drains it. Delivery is at-least-once, so consumers must be idempotent on event_id."
+    },
+    "next_attempt_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Backoff schedule: 1s → 5s → 25s → 2m → 10m, then dead-letter."
+    },
+    "attempt_count": { "type": "integer", "minimum": 0 }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "name": "iris-ticketing-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "IRIS Intelligent Support Ticketing Platform — standalone multi-product ticketing",
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "core-service",
+    "gateway",
+    "worker",
+    "widget",
+    "admin-panel"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "infra:up": "podman-compose -f infra/podman-compose.yml up -d",
+    "infra:down": "podman-compose -f infra/podman-compose.yml down",
+    "infra:reset": "podman-compose -f infra/podman-compose.yml down -v && podman-compose -f infra/podman-compose.yml up -d",
+    "migrate": "npm run migrate --workspace=core-service",
+    "seed": "npm run seed --workspace=core-service",
+    "build": "npm run build --workspace=widget && npm run build --workspace=admin-panel",
+    "mock-product": "tsx scripts/mock-product.ts",
+    "dev": "node scripts/dev.mjs",
+    "dev:core": "npm run dev --workspace=core-service",
+    "dev:gateway": "npm run dev --workspace=gateway",
+    "dev:widget": "npm run dev --workspace=widget",
+    "test": "npm run test:ts && npm run test:py",
+    "test:ts": "vitest run",
+    "test:py": "python -m pytest shared/hmac-utils/py ai-service/tests -q",
+    "test:watch": "vitest",
+    "test:e2e": "node scripts/smoke.mjs && node scripts/smoke-admin.mjs && node scripts/smoke-contract.mjs",
+    "test:security": "node scripts/smoke.mjs && node scripts/smoke-admin.mjs",
+    "test:admin": "node scripts/smoke-admin.mjs",
+    "test:contract": "node scripts/smoke-contract.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:sso": "node scripts/rfp-sso-check.mjs",
+    "test:rfp": "node scripts/rfp-first-ticket.mjs",
+    "dev:worker": "npm run dev --workspace=worker",
+    "test:ai": "tsx scripts/smoke-ai.mjs",
+    "images:build": "podman build -f ai-service/Containerfile -t localhost/iris-ai-service:latest . && podman build -f worker/Containerfile -t localhost/iris-worker:latest .",
+    "test:hmac": "tsx scripts/smoke-hmac.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "yaml": "^2.9.0"
+  }
+}

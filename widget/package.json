@@ -1,0 +1,15 @@
+{
+  "name": "@iris/widget",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The embeddable support assistant. One script tag, iframe-isolated, server-configured.",
+  "scripts": {
+    "dev": "vite --port 3100",
+    "build": "vite build --config vite.app.config.ts && vite build --config vite.loader.config.ts",
+    "preview": "vite preview --port 3100"
+  },
+  "devDependencies": {
+    "vite": "^6.0.5"
+  }
+}

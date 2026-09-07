@@ -1,0 +1,7 @@
+tests/
+eval/
+__pycache__/
+*.pyc
+.pytest_cache/
+SKILLS.md
+TODO.md

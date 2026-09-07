@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "sourceMap": false,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "jsx": "react-jsx",
+    "paths": {
+      "@iris/shared": ["./shared/index.ts"],
+      "@iris/shared/hmac": ["./shared/hmac-utils/ts/index.ts"],
+      "@iris/shared/types": ["./shared/types/index.ts"]
+    }
+  },
+  "include": [
+    "shared/**/*.ts",
+    "core-service/src/**/*.ts",
+    "gateway/src/**/*.ts",
+    "worker/src/**/*.ts",
+    "widget/src/**/*.ts",
+    "admin-panel/src/**/*.tsx",
+    "admin-panel/src/**/*.ts",
+    "scripts/**/*.ts",
+    "types/**/*.d.ts"
+  ],
+  "exclude": ["node_modules", "**/dist/**"]
+}

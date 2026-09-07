@@ -1,0 +1,377 @@
+{
+  "$comment": "Shared contract fixtures. Consumed by BOTH shared/contracts/ai-contracts.test.ts (AJV) and ai-service/tests/test_contracts.py (jsonschema), against the SAME ai-contracts.schema.json. This mirrors shared/hmac-utils/vectors.json: if the TypeScript and Python views of a contract ever diverge, one of the suites goes red immediately instead of an integrator discovering it at a boundary. Each case names the $def it targets, the payload, and whether that payload must validate.",
+
+  "cases": [
+    {
+      "name": "valid AIJob",
+      "def": "ai_job",
+      "valid": true,
+      "payload": {
+        "job_id": "aij_01JQZ8X5N3AAAAAAAAAAAAAAA",
+        "event_id": "evt_01JQZ8X4M2AAAAAAAAAAAAAAA",
+        "feature": "noop",
+        "product_id": "prod_carbon",
+        "ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA",
+        "correlation_id": "req_01JQZ8X4M4",
+        "requested_at": "2026-09-07T10:00:00.000Z",
+        "attempt": 1
+      }
+    },
+    {
+      "name": "invalid AIJob — missing event_id",
+      "def": "ai_job",
+      "valid": false,
+      "payload": {
+        "job_id": "aij_01JQZ8X5N3AAAAAAAAAAAAAAA",
+        "feature": "noop",
+        "product_id": "prod_carbon",
+        "ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA",
+        "correlation_id": "req_01JQZ8X4M4",
+        "requested_at": "2026-09-07T10:00:00.000Z",
+        "attempt": 1
+      }
+    },
+    {
+      "name": "invalid AIJob — attempt below 1",
+      "def": "ai_job",
+      "valid": false,
+      "payload": {
+        "job_id": "aij_01JQZ8X5N3AAAAAAAAAAAAAAA",
+        "event_id": "evt_01JQZ8X4M2AAAAAAAAAAAAAAA",
+        "feature": "noop",
+        "product_id": "prod_carbon",
+        "ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA",
+        "correlation_id": "req_01JQZ8X4M4",
+        "requested_at": "2026-09-07T10:00:00.000Z",
+        "attempt": 0
+      }
+    },
+    {
+      "name": "invalid AIJob — unknown feature",
+      "def": "ai_job",
+      "valid": false,
+      "payload": {
+        "job_id": "aij_01JQZ8X5N3AAAAAAAAAAAAAAA",
+        "event_id": "evt_01JQZ8X4M2AAAAAAAAAAAAAAA",
+        "feature": "telepathy",
+        "product_id": "prod_carbon",
+        "ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA",
+        "correlation_id": "req_01JQZ8X4M4",
+        "requested_at": "2026-09-07T10:00:00.000Z",
+        "attempt": 1
+      }
+    },
+    {
+      "name": "invalid AIJob — carries the ticket body (payload must stay identity-only)",
+      "def": "ai_job",
+      "valid": false,
+      "payload": {
+        "job_id": "aij_01JQZ8X5N3AAAAAAAAAAAAAAA",
+        "event_id": "evt_01JQZ8X4M2AAAAAAAAAAAAAAA",
+        "feature": "noop",
+        "product_id": "prod_carbon",
+        "ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA",
+        "correlation_id": "req_01JQZ8X4M4",
+        "requested_at": "2026-09-07T10:00:00.000Z",
+        "attempt": 1,
+        "description": "Cannot export the Q3 emissions report."
+      }
+    },
+
+    {
+      "name": "valid AIInputRequest (claims)",
+      "def": "ai_input_request",
+      "valid": true,
+      "payload": {
+        "job_id": "aij_01JQZ8X5N3AAAAAAAAAAAAAAA",
+        "feature": "noop",
+        "attempt": 1,
+        "correlation_id": "req_01JQZ8X4M4",
+        "claimed_product_id": "prod_carbon",
+        "claimed_ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA"
+      }
+    },
+    {
+      "name": "invalid AIInputRequest — bare product_id instead of claimed_product_id",
+      "def": "ai_input_request",
+      "valid": false,
+      "payload": {
+        "job_id": "aij_01JQZ8X5N3AAAAAAAAAAAAAAA",
+        "feature": "noop",
+        "attempt": 1,
+        "correlation_id": "req_01JQZ8X4M4",
+        "product_id": "prod_carbon",
+        "claimed_ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA"
+      }
+    },
+
+    {
+      "name": "valid AIInputResponse — ready",
+      "def": "ai_input_response",
+      "valid": true,
+      "payload": {
+        "status": "ready",
+        "feature": "noop",
+        "correlation_id": "req_01JQZ8X4M4",
+        "ticket": {
+          "ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA",
+          "subject": "Q3 export fails",
+          "description": "Cannot export the Q3 emissions report."
+        },
+        "taxonomy": {
+          "categories": [{ "value": "reports", "label": "Reports & Exports" }],
+          "severities": ["low", "medium", "high", "critical"]
+        },
+        "thresholds": {
+          "auto_route_p1": 0.8,
+          "auto_route_margin": 0.25,
+          "triage_floor": 0.5
+        }
+      }
+    },
+    {
+      "name": "valid AIInputResponse — already_applied (no ticket data present)",
+      "def": "ai_input_response",
+      "valid": true,
+      "payload": {
+        "status": "already_applied",
+        "feature": "noop",
+        "correlation_id": "req_01JQZ8X4M4",
+        "execution_id": "aix_01JQZ8X4M5AAAAAAAAAAAAAAA",
+        "execution_status": "succeeded"
+      }
+    },
+    {
+      "name": "invalid AIInputResponse — already_applied smuggling a ticket",
+      "def": "ai_input_response",
+      "valid": false,
+      "payload": {
+        "status": "already_applied",
+        "feature": "noop",
+        "correlation_id": "req_01JQZ8X4M4",
+        "execution_id": "aix_01JQZ8X4M5AAAAAAAAAAAAAAA",
+        "execution_status": "succeeded",
+        "ticket": {
+          "ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA",
+          "subject": null,
+          "description": "leaked"
+        }
+      }
+    },
+    {
+      "name": "invalid AIInputResponse — ready leaking product_id",
+      "def": "ai_input_response",
+      "valid": false,
+      "payload": {
+        "status": "ready",
+        "feature": "noop",
+        "correlation_id": "req_01JQZ8X4M4",
+        "product_id": "prod_carbon",
+        "ticket": {
+          "ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA",
+          "subject": null,
+          "description": "hello"
+        },
+        "taxonomy": { "categories": [], "severities": [] },
+        "thresholds": {
+          "auto_route_p1": 0.8,
+          "auto_route_margin": 0.25,
+          "triage_floor": 0.5
+        }
+      }
+    },
+
+    {
+      "name": "valid AIExecuteRequest — noop, minimal",
+      "def": "ai_execute_request",
+      "valid": true,
+      "payload": {
+        "feature": "noop",
+        "request_id": "req_01JQZ8X4M4",
+        "input": { "subject": null, "description": "Cannot export the Q3 report." }
+      }
+    },
+    {
+      "name": "valid AIExecuteRequest — with taxonomy and thresholds",
+      "def": "ai_execute_request",
+      "valid": true,
+      "payload": {
+        "feature": "classification",
+        "request_id": "req_01JQZ8X4M4",
+        "input": {
+          "subject": "Q3 export fails",
+          "description": "Cannot export the Q3 report.",
+          "taxonomy": {
+            "categories": [{ "value": "reports", "label": "Reports & Exports" }],
+            "severities": ["low", "high"]
+          },
+          "thresholds": {
+            "auto_route_p1": 0.8,
+            "auto_route_margin": 0.25,
+            "triage_floor": 0.5
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid AIExecuteRequest — tenant identifier crossing the boundary",
+      "def": "ai_execute_request",
+      "valid": false,
+      "payload": {
+        "feature": "noop",
+        "request_id": "req_01JQZ8X4M4",
+        "product_id": "prod_carbon",
+        "input": { "subject": null, "description": "hello" }
+      }
+    },
+    {
+      "name": "invalid AIExecuteRequest — raiser identity crossing the boundary",
+      "def": "ai_execute_request",
+      "valid": false,
+      "payload": {
+        "feature": "noop",
+        "request_id": "req_01JQZ8X4M4",
+        "input": {
+          "subject": null,
+          "description": "hello",
+          "raiser_email": "someone@example.com"
+        }
+      }
+    },
+    {
+      "name": "invalid AIExecuteRequest — missing description",
+      "def": "ai_execute_request",
+      "valid": false,
+      "payload": {
+        "feature": "noop",
+        "request_id": "req_01JQZ8X4M4",
+        "input": { "subject": "only a subject" }
+      }
+    },
+
+    {
+      "name": "valid AIResult — noop success",
+      "def": "ai_result",
+      "valid": true,
+      "payload": {
+        "feature": "noop",
+        "status": "succeeded",
+        "data": { "ok": true, "received_chars": 28 },
+        "provider": "stub",
+        "model": "stub-noop",
+        "model_version": "1",
+        "latency_ms": 2,
+        "fallback_used": false
+      }
+    },
+    {
+      "name": "valid AIResult — temporary failure",
+      "def": "ai_result",
+      "valid": true,
+      "payload": {
+        "feature": "noop",
+        "status": "failed",
+        "data": {},
+        "error": {
+          "kind": "temporary",
+          "code": "provider_timeout",
+          "message": "upstream provider did not respond in time"
+        }
+      }
+    },
+    {
+      "name": "valid AIResult — permanent failure",
+      "def": "ai_result",
+      "valid": true,
+      "payload": {
+        "feature": "noop",
+        "status": "failed",
+        "data": {},
+        "error": {
+          "kind": "permanent",
+          "code": "invalid_input",
+          "message": "description is empty"
+        }
+      }
+    },
+    {
+      "name": "invalid AIResult — missing data",
+      "def": "ai_result",
+      "valid": false,
+      "payload": { "feature": "noop", "status": "succeeded" }
+    },
+    {
+      "name": "invalid AIResult — confidence above 1",
+      "def": "ai_result",
+      "valid": false,
+      "payload": {
+        "feature": "noop",
+        "status": "succeeded",
+        "data": { "ok": true, "received_chars": 1 },
+        "confidence": 1.4
+      }
+    },
+    {
+      "name": "invalid AIError — kind outside temporary/permanent",
+      "def": "ai_error",
+      "valid": false,
+      "payload": { "kind": "maybe", "code": "x", "message": "y" }
+    },
+
+    {
+      "name": "valid noop data",
+      "def": "noop_data",
+      "valid": true,
+      "payload": { "ok": true, "received_chars": 0 }
+    },
+    {
+      "name": "invalid noop data — ok missing (the malformed-model case)",
+      "def": "noop_data",
+      "valid": false,
+      "payload": { "received_chars": 12 }
+    },
+    {
+      "name": "invalid noop data — ok is false",
+      "def": "noop_data",
+      "valid": false,
+      "payload": { "ok": false, "received_chars": 12 }
+    },
+    {
+      "name": "invalid noop data — received_chars negative",
+      "def": "noop_data",
+      "valid": false,
+      "payload": { "ok": true, "received_chars": -1 }
+    },
+
+    {
+      "name": "valid AIResultRequest",
+      "def": "ai_result_request",
+      "valid": true,
+      "payload": {
+        "job_id": "aij_01JQZ8X5N3AAAAAAAAAAAAAAA",
+        "feature": "noop",
+        "attempt": 2,
+        "correlation_id": "req_01JQZ8X4M4",
+        "claimed_product_id": "prod_carbon",
+        "claimed_ticket_id": "tkt_01JQZ8X4M3AAAAAAAAAAAAAAA",
+        "result": {
+          "feature": "noop",
+          "status": "succeeded",
+          "data": { "ok": true, "received_chars": 28 }
+        }
+      }
+    },
+
+    {
+      "name": "valid AIResultResponse — duplicate suppressed",
+      "def": "ai_result_response",
+      "valid": true,
+      "payload": {
+        "execution_id": "aix_01JQZ8X4M5AAAAAAAAAAAAAAA",
+        "status": "succeeded",
+        "applied": false,
+        "ticket_updated": false
+      }
+    }
+  ]
+}

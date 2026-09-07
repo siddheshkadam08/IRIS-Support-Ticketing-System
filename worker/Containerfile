@@ -1,0 +1,33 @@
+# IRIS AI worker.
+#
+# Build context is the REPO ROOT, because the worker imports @iris/shared —
+# the contracts are the only coordination artifact between services and must
+# not be vendored into a copy that can drift.
+#
+#   podman build -f worker/Containerfile -t localhost/iris-worker .
+FROM docker.io/library/node:22-slim
+
+WORKDIR /app
+
+# Workspace manifests first so a source change does not reinstall everything.
+COPY package.json package-lock.json ./
+COPY shared/package.json ./shared/
+COPY worker/package.json ./worker/
+
+# The worker and shared workspaces only. core-service, gateway, widget and
+# admin-panel are not installed: this process must not even have the ability
+# to import a database client.
+RUN npm install --omit=dev --workspace=worker --workspace=shared --ignore-scripts \
+ && npm install -g tsx@4.19.2
+
+COPY shared ./shared
+COPY worker ./worker
+COPY tsconfig.base.json tsconfig.json ./
+
+# NO DATABASE URL, DELIBERATELY. Every read and write goes through
+# core-service/internal/*. A connection string here would be a second,
+# unpoliced path around RLS — /SKILLS.md invariant 1.
+ENV NODE_ENV=production
+
+# No HTTP port: this is a consumer, not a server.
+CMD ["tsx", "worker/src/index.ts"]

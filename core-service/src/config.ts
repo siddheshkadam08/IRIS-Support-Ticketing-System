@@ -1,0 +1,97 @@
+import { z } from 'zod';
+import { loadRootEnv } from '@iris/shared/types';
+
+loadRootEnv();
+
+/**
+ * Validated at boot. A service that starts with a missing config value and
+ * fails on the first request is worse than one that refuses to start.
+ */
+const Env = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  LOG_LEVEL: z.string().default('info'),
+  CORE_PORT: z.coerce.number().default(4100),
+  CORE_DATABASE_URL: z.string().min(1),
+  ADMIN_DATABASE_URL: z.string().min(1).optional(),
+  INTERNAL_API_KEY: z.string().min(8).default('dev_internal_key_change_me'),
+  // Signs support-user session tokens.
+  SESSION_SECRET: z.string().min(16).default('dev_session_secret_change_me_please'),
+  // Encrypts product client/webhook secrets at rest (AES-256-GCM).
+  SECRET_ENCRYPTION_KEY: z.string().min(16).default('dev_secret_encryption_key_change_me'),
+  // Where the in-process outbox drainer posts access callbacks from.
+  PUBLIC_BASE_URL: z.string().default('http://localhost:4000'),
+  STORAGE_DRIVER: z.enum(['local']).default('local'),
+  STORAGE_LOCAL_PATH: z.string().default('./.data/attachments'),
+  MAX_ATTACHMENT_BYTES: z.coerce.number().default(26_214_400),
+
+  // ── AI foundation (Phase 1) ──────────────────────────────────────────
+  // Redis is where the AI dispatcher enqueues. Optional: without it the
+  // dispatcher simply never starts and ticket creation is unaffected — AI
+  // must never be a dependency for basic ticketing.
+  REDIS_URL: z.string().optional(),
+  AI_QUEUE_NAME: z.string().default('ai.jobs'),
+  /**
+   * Kill switch. Off means no AI job is ever enqueued; tickets, audit and the
+   * outbox behave exactly as they do today. This is the graceful-degradation
+   * lever, not a debug flag.
+   */
+  AI_DISPATCH_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  /**
+   * Watermark. The outbox already holds historical ticket.created rows that
+   * predate the AI pipeline (5 of them on the dev database at the time of
+   * writing). Without an explicit floor, switching the dispatcher on would
+   * immediately enqueue AI work for old tickets.
+   *
+   * Deliberately FAILS CLOSED: if this is unset the dispatcher dispatches
+   * nothing and says so, rather than guessing a start point.
+   */
+  AI_DISPATCH_FROM: z.string().optional(),
+  AI_DISPATCH_POLL_MS: z.coerce.number().default(1000),
+  AI_DISPATCH_BATCH: z.coerce.number().default(20),
+  /**
+   * Phase 2 — service-to-service HMAC.
+   *
+   * Verifies signatures on /internal/ai/*. This is NOT the gateway's
+   * INTERNAL_API_KEY: the worker holds only this, and it is valid on no other
+   * route. Key separation is the actual fix for the escalation Phase 2 closed
+   * — signatures are the mechanism, not the point.
+   *
+   * A dev placeholder keeps a fresh clone runnable (the same convention
+   * INTERNAL_API_KEY already uses); production refuses to boot on it.
+   */
+  AI_WORKER_HMAC_SECRET: z
+    .string()
+    .min(16)
+    .default('dev_ai_worker_hmac_secret_change_me'),
+});
+
+const parsed = Env.safeParse(process.env);
+if (!parsed.success) {
+  console.error('[core-service] invalid environment:\n', parsed.error.flatten().fieldErrors);
+  process.exit(1);
+}
+
+/** Placeholders that must never reach production. Names are logged, never values. */
+const DEV_PLACEHOLDERS = new Set(['dev_ai_worker_hmac_secret_change_me']);
+
+/**
+ * Fail fast in production on a known-value or weak signing secret. A secret
+ * that ships in the repository is not a secret, and a short one is
+ * brute-forceable offline once an attacker captures a single signed request.
+ */
+if (parsed.data.NODE_ENV === 'production') {
+  const weak: string[] = [];
+  const s = parsed.data.AI_WORKER_HMAC_SECRET;
+  if (DEV_PLACEHOLDERS.has(s)) weak.push('AI_WORKER_HMAC_SECRET (dev placeholder)');
+  else if (s.length < 32) weak.push('AI_WORKER_HMAC_SECRET (needs >= 32 chars)');
+  if (weak.length) {
+    console.error('[core-service] refusing to start in production with:', weak.join(', '));
+    process.exit(1);
+  }
+}
+
+export const config = parsed.data;
+export const isDev = config.NODE_ENV === 'development';

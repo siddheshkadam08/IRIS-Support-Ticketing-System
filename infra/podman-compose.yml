@@ -1,0 +1,188 @@
+# IRIS Ticketing Platform — local development stack
+#
+#   podman-compose -f infra/podman-compose.yml up -d
+#
+# Deliberately isolated from anything else on this machine:
+#   - Postgres on 5432   (the native Windows PostgreSQL 18 on 5433 is untouched)
+#   - Redis    on 6380   (6379 is occupied by an unrelated `rfp-redis` container)
+#   - AI       on 5000   (internal only; called by `worker`, never by a browser)
+#
+# No service is bound to a public interface. See docs/port-mapping.md.
+#
+# ⚠️ BUILDING IMAGES: use `npm run images:build`, not `podman-compose build`.
+# podman-compose 1.6.0 on Windows parses `build.dockerfile` correctly (visible
+# in `podman-compose config`) but does not pass `-f` through to podman, so any
+# Containerfile outside the context root fails with "no Containerfile ... found
+# in context directory". Both images need a repo-root context — ai-service to
+# copy shared/hmac-utils/py, worker to copy shared/ — so both hit it.
+# `npm run images:build` runs the equivalent `podman build -f ...` directly.
+# The build: blocks below stay for the target topology and newer tooling.
+#
+# `core-service`, `gateway` and `worker` run on the HOST under `npm run dev`,
+# reaching these containers through their published 127.0.0.1 ports. Only the
+# stateful services and the Python AI service are containerised locally.
+#
+# `iris-worker` is defined for the TARGET VPS topology and sits behind the
+# `vps` profile, so it does NOT start by default:
+#
+#   podman-compose -f infra/podman-compose.yml --profile vps up -d
+#
+# It is excluded locally for a concrete reason, not squeamishness:
+# core-service binds to 127.0.0.1 (server.ts), so a containerised worker
+# genuinely cannot reach it. On the VPS core-service is a container too and
+# the profile becomes the whole stack.
+version: "3.8"
+
+services:
+  iris-postgres:
+    image: docker.io/pgvector/pgvector:pg17
+    container_name: iris-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_dev_pw
+      POSTGRES_DB: iris
+      # Deterministic collation so ts_rank / ORDER BY are stable across machines
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - iris_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d iris"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  iris-redis:
+    image: docker.io/library/redis:7-alpine
+    container_name: iris-redis
+    # ─────────────────────────────────────────────────────────────────────
+    # AOF is ON since Phase 1, and this is a correctness change, not tuning.
+    #
+    # Redis previously ran with persistence disabled, which was fine when it
+    # only held rate-limit counters. It now also holds QUEUED AI JOBS, and a
+    # restart would discard them.
+    #
+    # It is NOT the idempotency mechanism — that is UNIQUE(event_id, feature)
+    # in Postgres, deliberately, because a guard living only in Redis
+    # evaporates exactly when duplicates happen. AOF protects queued WORK;
+    # Postgres protects CORRECTNESS. The outbox is still the source of truth:
+    # a row is only marked published after the enqueue succeeds.
+    #
+    # everysec: at most one second of queued jobs lost on an unclean stop, and
+    # the outbox re-dispatches those anyway. `always` would cost an fsync per
+    # job for no benefit given that backstop.
+    # ─────────────────────────────────────────────────────────────────────
+    command:
+      [
+        "redis-server",
+        "--appendonly", "yes",
+        "--appendfsync", "everysec",
+        "--save", "",
+      ]
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - iris_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  iris-ai-service:
+    build:
+      # Repo root: the image needs shared/hmac-utils/py/iris_hmac as well as
+      # ai-service/, so signer and verifier stay one implementation.
+      context: ..
+      dockerfile: ai-service/Containerfile
+    image: localhost/iris-ai-service:latest
+    container_name: iris-ai-service
+    environment:
+      LOG_LEVEL: info
+      AI_SERVICE_PORT: 5000
+      # Phase 2: verifies the worker's request signatures with the shared
+      # iris_hmac package. Deliberately DIFFERENT from AI_WORKER_HMAC_SECRET —
+      # leaking this one must not grant access to core-service. This service
+      # never receives INTERNAL_API_KEY or AI_WORKER_HMAC_SECRET, and refuses
+      # to boot if either is present.
+      AI_SERVICE_HMAC_SECRET: ${AI_SERVICE_HMAC_SECRET:-dev_ai_service_hmac_secret_change_me}
+      AI_SERVICE_ISOLATED_ENV: "1"
+      # ───────────────────────────────────────────────────────────────────
+      # THERE IS NO DATABASE URL HERE, AND THERE MUST NEVER BE ONE.
+      #
+      # ADR-007: this service holds no Postgres credential. Not a wrong one —
+      # none. RLS is applied per-session by core-service, and a second
+      # connection is a second, unpoliced path to the data. src/config.py
+      # refuses to boot if any *DATABASE_URL* is present, so an accidental
+      # addition kills the container instead of silently working.
+      #
+      # If this service ever needs neighbours for retrieval, it calls back into
+      # core-service/internal/*, which runs the query RLS-scoped.
+      # ───────────────────────────────────────────────────────────────────
+    ports:
+      # 127.0.0.1 only. `worker` runs on the host locally; in the target
+      # topology this port is not published at all and the worker reaches it
+      # over the internal network.
+      - "127.0.0.1:5000:5000"
+    healthcheck:
+      test:
+        ["CMD", "python", "-c",
+         "import urllib.request;urllib.request.urlopen('http://127.0.0.1:5000/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  iris-worker:
+    build:
+      context: ..
+      dockerfile: worker/Containerfile
+    image: localhost/iris-worker:latest
+    container_name: iris-worker
+    # Target topology only — see the header. Locally: `npm run dev:worker`.
+    profiles: ["vps"]
+    depends_on:
+      iris-redis:
+        condition: service_healthy
+      iris-ai-service:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: info
+      # Redis is on the compose network, so the service name resolves.
+      REDIS_URL: redis://iris-redis:6379
+      AI_QUEUE_NAME: ai.jobs
+      AI_WORKER_CONCURRENCY: 4
+      # LOCAL topology: core-service runs on the HOST under `npm run dev`, so
+      # the worker reaches it through Podman's host gateway. In the target VPS
+      # topology core-service is a container here too and this becomes
+      # http://iris-core-service:4100 — the only line that changes.
+      CORE_SERVICE_URL: http://host.containers.internal:4100
+      # NO INTERNAL_API_KEY. That is the gateway's platform-wide credential and
+      # core-service accepts it on every route; holding it let a compromised
+      # worker read any tenant's tickets and reach the admin API as super_admin.
+      # Phase 2 replaced it with a signature valid only on /internal/ai/*.
+      AI_WORKER_HMAC_SECRET: ${AI_WORKER_HMAC_SECRET:-dev_ai_worker_hmac_secret_change_me}
+      AI_SERVICE_URL: http://iris-ai-service:5000
+      AI_SERVICE_HMAC_SECRET: ${AI_SERVICE_HMAC_SECRET:-dev_ai_service_hmac_secret_change_me}
+      # Bound every outbound call: a hung request must not hold a worker slot.
+      CORE_TIMEOUT_MS: 5000
+      AI_TIMEOUT_MS: 10000
+      # ───────────────────────────────────────────────────────────────────
+      # NO DATABASE URL. The worker reads and writes only through
+      # core-service/internal/*. See /SKILLS.md invariant 1.
+      # ───────────────────────────────────────────────────────────────────
+    extra_hosts:
+      # Podman resolves host.containers.internal natively, but naming it
+      # explicitly keeps this working on hosts where it does not.
+      - "host.containers.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  iris_pgdata:
+  # AOF needs somewhere durable to live; without this the appendonly file dies
+  # with the container and enabling it would have achieved nothing.
+  iris_redisdata:

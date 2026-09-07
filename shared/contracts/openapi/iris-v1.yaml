@@ -1,0 +1,1015 @@
+openapi: 3.1.0
+
+# ─────────────────────────────────────────────────────────────────────────
+# THE authoritative machine-readable definition of the /v1 surface.
+#
+# docs/api-contract.md is its prose companion; where the two disagree, this
+# file wins because it is the one CI validates live responses against
+# (shared/contracts/contracts.test.ts and scripts/smoke.mjs).
+#
+# Rules that govern changes to this file — see docs/api-contract.md §9:
+#   · The spec changes in the SAME PR as the code. A spec updated "later" is
+#     a spec that is already wrong.
+#   · Additive changes only within v1: new optional request fields, new
+#     response fields, new enum members, new endpoints, new event types.
+#   · Anything else is v2. Removing or renaming a field, narrowing a type,
+#     changing a status code's meaning, or adding a required request field
+#     all break existing integrators.
+# ─────────────────────────────────────────────────────────────────────────
+
+info:
+  title: IRIS Ticketing Platform — Integration API
+  version: '1.0.0'
+  summary: The only external surface. Everything an integrating product can do, it does here.
+  description: |
+    A standalone multi-product support ticketing platform. Products integrate
+    through this REST contract plus an embeddable widget; they never own ticket
+    data and never build a support UI.
+
+    **Authentication** comes in two forms:
+
+    - **Server credential** — `client_id` + HMAC-SHA256 over a canonical request
+      string. Full access to the product's own tickets.
+    - **Publishable key** — safe to ship in a browser. Permits exactly four
+      operations, all scoped to the bearer of the accompanying identity JWT.
+
+    A verifiable HMAC test vector is published in `docs/api-contract.md` §3.3 so
+    an integrator can self-check their signing code before their first live call.
+  contact:
+    name: IRIS Platform Team
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://support.iris.example
+    description: Production
+  - url: http://localhost:4000
+    description: Local development (the gateway)
+
+tags:
+  - name: Tickets
+    description: Raise, read, comment on and transition tickets.
+  - name: Widget
+    description: Endpoints the embeddable widget calls with a publishable key.
+  - name: Knowledge base
+    description: Article search and retrieval, used for deflection.
+  - name: Attachments
+    description: Two-step upload, then reference by id.
+
+security:
+  - HmacSignature: []
+    HmacKey: []
+    HmacTimestamp: []
+    HmacNonce: []
+
+paths:
+  /v1/tickets:
+    post:
+      tags: [Tickets]
+      operationId: createTicket
+      summary: Raise a ticket
+      description: |
+        Returns in under 300ms and does **not** wait for AI. `summary` is null
+        and `classification_source` may be `unclassified` at this instant; both
+        fill in within ~10s and are announced via the `ticket.classified` webhook.
+
+        If you supply `category`/`severity` they are authoritative and AI will
+        not override them.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/Identity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTicketRequest' }
+      responses:
+        '201':
+          description: Created
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/XRequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ticket' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+    get:
+      tags: [Tickets]
+      operationId: listTickets
+      summary: List and filter tickets
+      description: |
+        Always scoped to the calling product. There is no parameter that widens
+        scope — cross-product visibility exists only in the admin portal, for
+        authorised support users.
+
+        With a publishable key the results are additionally restricted to
+        tickets raised by the accompanying identity, enforced by a row-level
+        security policy rather than an application check.
+      parameters:
+        - { name: status, in: query, schema: { type: string }, description: 'CSV, e.g. `open,assigned`' }
+        - { name: category, in: query, schema: { type: string }, description: CSV }
+        - { name: severity, in: query, schema: { type: string }, description: CSV }
+        - { name: product_tenant_id, in: query, schema: { type: string } }
+        - { name: raised_by, in: query, schema: { type: string }, description: Your opaque `sub` }
+        - { name: updated_after, in: query, schema: { type: string, format: date-time }, description: Use for incremental sync / webhook gap recovery }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Identity'
+      responses:
+        '200':
+          description: A page of tickets
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TicketPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/tickets/{id}:
+    get:
+      tags: [Tickets]
+      operationId: getTicket
+      summary: Retrieve a ticket
+      description: |
+        Accepts either the platform id (`tkt_…`) or the human reference
+        (`CARB-1042`).
+
+        Comments flagged `is_internal` are **never** included in any
+        product-facing response — they are filtered at the database, not merely
+        in the API layer.
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+        - $ref: '#/components/parameters/Identity'
+      responses:
+        '200':
+          description: The ticket, with comments and attachments
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TicketDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/tickets/{id}/comments:
+    post:
+      tags: [Tickets]
+      operationId: addComment
+      summary: Add a comment
+      description: |
+        Author is derived from `X-IRIS-Identity` when present. Products **cannot**
+        create internal notes — those are a support-side concept and are neither
+        writable nor readable across this boundary.
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/Identity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, minLength: 1, maxLength: 10000 }
+      responses:
+        '201':
+          description: Comment created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, ticket_id, created_at]
+                properties:
+                  id: { type: string, examples: ['cmt_01JQZ7YC5M'] }
+                  ticket_id: { type: string }
+                  created_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/tickets/{id}/status:
+    patch:
+      tags: [Tickets]
+      operationId: changeTicketStatus
+      summary: Change ticket status
+      description: |
+        Guarded by the state machine. Transitions available to a **product**
+        credential are deliberately narrow — `closed` and `open` (reopen) only.
+        Assignment, `in_progress` and `resolved` are support-side actions: a
+        product cannot mark its own ticket resolved.
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+        - $ref: '#/components/parameters/Identity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/TicketStatus' }
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Updated ticket
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ticket' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            Illegal transition. `details.allowed[]` lists the legal targets from
+            the ticket's current status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /v1/tickets/{id}/rating:
+    post:
+      tags: [Tickets]
+      operationId: rateTicket
+      summary: Rate a resolved ticket
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+        - $ref: '#/components/parameters/Identity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5 }
+                comment: { type: [string, 'null'], maxLength: 2000 }
+      responses:
+        '200':
+          description: Rating recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, rating]
+                properties:
+                  ok: { type: boolean }
+                  rating: { type: integer }
+        '409':
+          description: Only a resolved or closed ticket can be rated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /v1/tickets/{id}/history:
+    get:
+      tags: [Tickets]
+      operationId: getTicketHistory
+      summary: Full ticket timeline
+      description: |
+        Chronological merge of state transitions, comments, attachments and
+        **access grant/revoke events with the product's own responses**. This is
+        the endpoint that makes the audit trail externally verifiable rather
+        than only internally logged.
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+      responses:
+        '200':
+          description: Timeline
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/HistoryEntry' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/tickets/{id}/attachments:
+    post:
+      tags: [Attachments]
+      operationId: linkAttachments
+      summary: Attach previously uploaded files to a ticket
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+        - $ref: '#/components/parameters/Identity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [attachment_ids]
+              properties:
+                attachment_ids:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200':
+          description: |
+            Number of attachments linked. Ids that are unknown, already linked
+            to another ticket, or outside your product are silently skipped —
+            the count tells you how many actually attached.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [linked]
+                properties:
+                  linked: { type: integer, minimum: 0 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/widget/config:
+    get:
+      tags: [Widget]
+      operationId: getWidgetConfig
+      summary: Widget bootstrap configuration
+      description: |
+        Everything product-specific — visible fields, categories, severities,
+        branding, enabled capabilities, suggested questions.
+
+        **This is what makes the zero-code tier literal:** a product changes its
+        widget by editing config in the admin portal, with no redeploy on its side.
+      security:
+        - PublishableKey: []
+      parameters:
+        - $ref: '#/components/parameters/Identity'
+      responses:
+        '200':
+          description: Widget definition
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WidgetConfig' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/widget/ask:
+    post:
+      tags: [Widget]
+      operationId: askQuestion
+      summary: Ask a question (deflection)
+      description: |
+        Retrieval over the product's knowledge base and its **resolved** tickets.
+
+        ⚠️ **This endpoint never creates a ticket** and never acts on one. It
+        returns no ticket id. It is *deflection* — a user getting an answer and
+        choosing not to file — not auto-resolution. See ADR-009.
+      security:
+        - PublishableKey: []
+      parameters:
+        - $ref: '#/components/parameters/Identity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question: { type: string, minLength: 1, maxLength: 2000 }
+                conversation_id: { type: [string, 'null'], maxLength: 80 }
+                context: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Candidate answers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AskResponse' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: |
+            `deflection_unavailable` — the search backend is down. **Ticket
+            creation is unaffected**; fall through to `POST /v1/tickets`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /v1/kb/articles:
+    get:
+      tags: [Knowledge base]
+      operationId: searchKbArticles
+      summary: Search the knowledge base
+      description: Only `published` articles in the product's public categories are ever returned.
+      security:
+        - PublishableKey: []
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: Full-text + trigram hybrid }
+        - { name: category, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Identity'
+      responses:
+        '200':
+          description: Matching articles
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KbArticlePage' }
+        '403':
+          description: '`knowledge_base_disabled` — not enabled for this product'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /v1/kb/articles/{id}:
+    get:
+      tags: [Knowledge base]
+      operationId: getKbArticle
+      summary: Retrieve one article
+      security:
+        - PublishableKey: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/Identity'
+      responses:
+        '200':
+          description: The article, including its body
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KbArticle' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/kb/articles/{id}/helpful:
+    post:
+      tags: [Knowledge base]
+      operationId: voteArticleHelpful
+      summary: Record a helpful vote
+      security:
+        - PublishableKey: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/Identity'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [helpful]
+              properties:
+                helpful: { type: boolean }
+      responses:
+        '200':
+          description: Vote recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/announcements:
+    get:
+      tags: [Widget]
+      operationId: listAnnouncements
+      summary: Product announcements
+      security:
+        - PublishableKey: []
+      responses:
+        '200':
+          description: Active announcements, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Announcement' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/attachments:
+    post:
+      tags: [Attachments]
+      operationId: uploadAttachment
+      summary: Upload a file
+      description: |
+        Max 25 MB. `image/svg+xml` and `text/html` are **rejected**: rendered
+        inline in an authenticated admin session they are stored XSS, so they
+        never enter the system. Downloads are always served
+        `Content-Disposition: attachment` from a separate origin.
+      security:
+        - PublishableKey: []
+      parameters:
+        - $ref: '#/components/parameters/Identity'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Uploaded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttachmentUpload' }
+        '413':
+          description: '`attachment_too_large`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415':
+          description: '`attachment_type_not_allowed`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /v1/attachments/{id}/content:
+    get:
+      tags: [Attachments]
+      operationId: downloadAttachment
+      summary: Download attachment content
+      security:
+        - PublishableKey: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/Identity'
+      responses:
+        '200':
+          description: Raw bytes, always as an attachment download
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              description: Always `attachment; filename="…"` — never rendered inline
+            X-Content-Type-Options:
+              schema: { type: string, const: nosniff }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    HmacKey:
+      type: apiKey
+      in: header
+      name: X-IRIS-Key
+      description: Your `client_id`.
+    HmacTimestamp:
+      type: apiKey
+      in: header
+      name: X-IRIS-Timestamp
+      description: Unix seconds. Must be within ±300s of platform time.
+    HmacNonce:
+      type: apiKey
+      in: header
+      name: X-IRIS-Nonce
+      description: UUIDv4, unique per request. Cached 600s.
+    HmacSignature:
+      type: apiKey
+      in: header
+      name: X-IRIS-Signature
+      description: |
+        `v1=<hex>` where hex is HMAC-SHA256 over the canonical string:
+
+            v1 \n METHOD \n PATH_WITH_QUERY \n TIMESTAMP \n NONCE \n sha256_hex(RAW_BODY)
+
+        Method and path are inside the signature, so a captured request cannot
+        be replayed against a different endpoint.
+    PublishableKey:
+      type: apiKey
+      in: header
+      name: X-IRIS-Publishable-Key
+      description: |
+        `pub_live_…`. Public by design and therefore low-privilege: it permits
+        only ticket creation, reading the bearer's own tickets, asking a
+        question, and searching the knowledge base — enforced against the
+        product's origin allowlist and tightly rate limited.
+
+  parameters:
+    TicketId:
+      name: id
+      in: path
+      required: true
+      description: Platform id (`tkt_…`) or human reference (`CARB-1042`).
+      schema: { type: string }
+      examples:
+        platformId: { value: tkt_01JQZ7YB3KX8M2N4P6R8T0V2W4 }
+        reference: { value: CARB-1042 }
+    Identity:
+      name: X-IRIS-Identity
+      in: header
+      required: false
+      description: |
+        A short-lived JWT the integrating product minted for the end user
+        (RS256/ES256, `exp − iat ≤ 300s`, audience `iris-ticketing`). Required
+        when acting on behalf of a raiser.
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Recommended on every POST. Same key + same payload replays the original
+        response for 24h; same key + different payload returns 409. Without one,
+        a retried request on a flaky network creates a duplicate ticket that a
+        human then has to merge.
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque. Cursor pagination, because offsets drift when rows insert mid-scan.
+      schema: { type: string }
+
+  headers:
+    XRequestId:
+      description: Quote this in any support conversation — it reconstructs the full cross-service trace.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: '`invalid_request` — malformed or failed schema validation'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Unauthorized:
+      description: '`signature_invalid`, `timestamp_out_of_window`, `nonce_replayed` or `identity_token_invalid`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Forbidden:
+      description: '`credential_scope_exceeded` or `origin_not_allowed`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotFound:
+      description: |
+        `ticket_not_found`. Deliberately indistinguishable from "not yours" — a
+        403 would confirm the resource exists.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Conflict:
+      description: '`invalid_state_transition` or `idempotency_key_reuse`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    RateLimited:
+      description: '`rate_limited`. Honour `Retry-After`.'
+      headers:
+        Retry-After: { schema: { type: integer }, description: Seconds }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+    TicketStatus:
+      type: string
+      enum: [open, assigned, in_progress, waiting_on_raiser, resolved, closed]
+      description: |
+        `assigned` exists because it is the transition that fires the dual JIT
+        access grant. `waiting_on_raiser` is displayed as "On Hold" and pauses
+        the SLA clock.
+
+    Severity:
+      type: string
+      enum: [low, medium, high, critical]
+      description: Stored and published as `severity`. Some UIs label the column "Priority"; that is display only.
+
+    ClassificationSource:
+      type: string
+      enum: [product, ai_auto, ai_uncertain, unclassified]
+
+    IdentityAssurance:
+      type: string
+      enum: [sso, email_verified, anonymous]
+
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      description: |
+        Every non-2xx response, without exception, has this shape. Branch on
+        `code` — never on `message`, which may be reworded without a version bump.
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+              enum:
+                - invalid_request
+                - unsupported_category
+                - signature_invalid
+                - timestamp_out_of_window
+                - nonce_replayed
+                - identity_token_invalid
+                - identity_provider_unreachable
+                - unauthenticated
+                - credential_scope_exceeded
+                - origin_not_allowed
+                - knowledge_base_disabled
+                - forbidden
+                - ticket_not_found
+                - not_found
+                - invalid_state_transition
+                - idempotency_key_reuse
+                - already_exists
+                - attachment_too_large
+                - attachment_type_not_allowed
+                - preauth_grant_invalid
+                - rate_limited
+                - internal_error
+                - service_unavailable
+                - deflection_unavailable
+            message: { type: string }
+            request_id: { type: string }
+            details: { type: object, additionalProperties: true }
+
+    CreateTicketRequest:
+      type: object
+      required: [description]
+      properties:
+        product_tenant_id:
+          type: string
+          maxLength: 200
+          description: Your customer. Opaque to the platform — recorded, never authenticated.
+        subject: { type: [string, 'null'], maxLength: 200 }
+        description: { type: string, minLength: 1, maxLength: 20000 }
+        category: { type: [string, 'null'], maxLength: 80 }
+        severity:
+          oneOf:
+            - $ref: '#/components/schemas/Severity'
+            - type: 'null'
+        conversation_id:
+          type: [string, 'null']
+          description: Links the ticket back to the widget conversation that produced it.
+        from_live_chat:
+          type: boolean
+          description: Set by the Live Chat tile; folds the conversation transcript into the description.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Opaque product data, echoed back.
+
+    RaisedBy:
+      type: object
+      required: [ref, name, email]
+      properties:
+        ref: { type: string, description: Your opaque `sub`. Never an email }
+        name: { type: [string, 'null'] }
+        email: { type: [string, 'null'] }
+
+    Assignee:
+      type: [object, 'null']
+      required: [id, display_name]
+      properties:
+        id: { type: string }
+        display_name: { type: string, description: Display name only — never the support user's internal record }
+
+    Ticket:
+      type: object
+      required:
+        [id, reference, status, product_tenant_id, description, classification_source,
+         raised_by, identity_assurance, raised_at]
+      properties:
+        id: { type: string, examples: ['tkt_01JQZ7YB3KX8M2N4P6R8T0V2W4'] }
+        reference:
+          type: string
+          description: Per-product, never a global sequence — a global counter leaks cross-product volume.
+          examples: ['CARB-1042']
+        status: { $ref: '#/components/schemas/TicketStatus' }
+        product_tenant_id: { type: string }
+        subject: { type: [string, 'null'] }
+        description: { type: string }
+        category: { type: [string, 'null'] }
+        severity:
+          oneOf:
+            - $ref: '#/components/schemas/Severity'
+            - type: 'null'
+        classification_source: { $ref: '#/components/schemas/ClassificationSource' }
+        summary: { type: [string, 'null'], description: Null until AI classification lands (~10s) }
+        raised_by: { $ref: '#/components/schemas/RaisedBy' }
+        identity_assurance: { $ref: '#/components/schemas/IdentityAssurance' }
+        rating: { type: [integer, 'null'], minimum: 1, maximum: 5 }
+        rating_comment: { type: [string, 'null'] }
+        raised_at: { type: string, format: date-time }
+        first_response_at:
+          type: [string, 'null']
+          format: date-time
+          description: First non-internal comment by a support user. Locked definition — ADR-006.
+        resolved_at: { type: [string, 'null'], format: date-time }
+        closed_at: { type: [string, 'null'], format: date-time }
+        assignee: { $ref: '#/components/schemas/Assignee' }
+
+    TicketDetail:
+      allOf:
+        - $ref: '#/components/schemas/Ticket'
+        - type: object
+          properties:
+            comments:
+              type: array
+              description: Internal notes are never included.
+              items: { $ref: '#/components/schemas/Comment' }
+            attachments:
+              type: array
+              items: { $ref: '#/components/schemas/Attachment' }
+
+    TicketPage:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Ticket' }
+        next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean }
+
+    Comment:
+      type: object
+      required: [id, author_type, body, created_at]
+      properties:
+        id: { type: string }
+        author_type: { type: string, enum: [raiser, assignee, system] }
+        author_name: { type: [string, 'null'] }
+        body: { type: string }
+        created_at: { type: string, format: date-time }
+
+    Attachment:
+      type: object
+      required: [id, filename, content_type, size_bytes, created_at]
+      properties:
+        id: { type: string }
+        filename: { type: string }
+        content_type: { type: string }
+        size_bytes: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+
+    AttachmentUpload:
+      type: object
+      required: [id, filename, content_type, size_bytes]
+      properties:
+        id: { type: string }
+        filename: { type: string }
+        content_type: { type: string }
+        size_bytes: { type: integer, minimum: 0 }
+
+    HistoryEntry:
+      type: object
+      required: [at, type]
+      properties:
+        at: { type: string, format: date-time }
+        type: { type: string, examples: ['ticket.assigned', 'access.granted'] }
+        actor:
+          type: object
+          properties:
+            type: { type: string }
+            ref: { type: [string, 'null'] }
+        detail: { type: ['object', 'null'], additionalProperties: true }
+        before: { type: ['object', 'null'], additionalProperties: true }
+        after: { type: ['object', 'null'], additionalProperties: true }
+
+    AskAnswer:
+      type: object
+      required: [type, id, title, excerpt, score]
+      properties:
+        type: { type: string, enum: [kb_article, resolved_ticket] }
+        id: { type: string }
+        title: { type: string }
+        excerpt: { type: string }
+        score: { type: number }
+        url: { type: string }
+
+    AskResponse:
+      type: object
+      required: [conversation_id, suggested_action, answers, prefill]
+      properties:
+        conversation_id: { type: string, examples: ['cnv_01JQZ9A8S6'] }
+        suggested_action:
+          type: string
+          enum: [answer, create_ticket]
+          description: |
+            `create_ticket` when the best score is below the product's
+            `deflection.min_score`. A weak answer is worse than no answer.
+        answers:
+          type: array
+          items: { $ref: '#/components/schemas/AskAnswer' }
+        prefill:
+          type: object
+          required: [description]
+          description: Carried into `POST /v1/tickets` if the user proceeds.
+          properties:
+            description: { type: string }
+            category: { type: [string, 'null'] }
+            severity:
+              oneOf:
+                - $ref: '#/components/schemas/Severity'
+                - type: 'null'
+
+    KbArticle:
+      type: object
+      required: [id, title, excerpt, helpful_pct, views]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        category: { type: [string, 'null'] }
+        excerpt: { type: string }
+        body: { type: string, description: Present only on single-article retrieval }
+        score: { type: number, description: Present only on search }
+        helpful_pct: { type: [integer, 'null'], minimum: 0, maximum: 100 }
+        views: { type: integer, minimum: 0 }
+
+    KbArticlePage:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/KbArticle' }
+        next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean }
+
+    Announcement:
+      type: object
+      required: [id, title, body, kind, published_at]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        body: { type: string }
+        kind: { type: string, enum: [info, maintenance, incident, release] }
+        published_at: { type: string, format: date-time }
+
+    WidgetConfig:
+      type: object
+      required: [product, branding, capabilities, fields, categories, severities, disclaimer, footer]
+      description: |
+        Everything the widget renders. A product changes its widget by editing
+        this server-side, with no redeploy on its side.
+      properties:
+        product:
+          type: object
+          required: [id, name, slug]
+          properties:
+            id: { type: string }
+            name: { type: string }
+            slug: { type: string }
+        branding:
+          type: object
+          required: [title, subtitle, greeting, primary_color, accent_color]
+          properties:
+            title: { type: string }
+            subtitle: { type: string }
+            greeting: { type: string }
+            primary_color: { type: string }
+            accent_color: { type: string }
+            logo_text: { type: [string, 'null'] }
+        capabilities:
+          type: array
+          description: Which of the eight tiles appear.
+          items:
+            type: string
+            enum: [ask, create_ticket, search_docs, my_tickets, upload_screenshot, live_chat, ai_suggestions, announcements]
+        fields:
+          type: object
+          properties:
+            subject: { type: boolean }
+            category: { type: boolean }
+            severity: { type: boolean }
+            attachments: { type: boolean }
+        categories:
+          type: array
+          items:
+            type: object
+            required: [value, label]
+            properties:
+              value: { type: string }
+              label: { type: string }
+        severities:
+          type: array
+          items:
+            type: object
+            required: [value, label]
+            properties:
+              value: { type: string }
+              label: { type: string }
+        default_severity: { type: string }
+        suggestions: { type: array, items: { type: string } }
+        knowledge_base_enabled: { type: boolean }
+        deflection_enabled: { type: boolean }
+        allow_anonymous: { type: boolean }
+        identity:
+          type: object
+          required: [authenticated]
+          properties:
+            authenticated: { type: boolean }
+            name: { type: [string, 'null'] }
+            email: { type: [string, 'null'] }
+        disclaimer: { type: string }
+        footer: { type: string }

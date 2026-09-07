@@ -1,0 +1,23 @@
+# Phase 1 — AI FOUNDATION ONLY.
+#
+# Every version is pinned. An unpinned transformer minor bump silently changes
+# vectors and stored embeddings stop matching new ones; pinning from the start
+# means that class of problem never begins.
+#
+# DELIBERATELY ABSENT, and enforced by ai-service/tests/test_isolation.py:
+#   psycopg / psycopg2 / asyncpg / sqlalchemy  — this service holds NO database
+#     credential. RLS is applied per-session by core-service, and a second
+#     connection is a second, unpoliced path to the data (ADR-007).
+#
+# ALSO ABSENT until their phase arrives — no speculative dependencies:
+#   sentence-transformers, scikit-learn, torch, numpy, any provider SDK.
+
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.10.4
+structlog==24.4.0
+
+# Test-only
+pytest==8.3.4
+httpx==0.28.1
+jsonschema==4.23.0

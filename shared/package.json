@@ -1,0 +1,18 @@
+{
+  "name": "@iris/shared",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-service contracts, HMAC utilities and shared types. The only coordination artifact between the Node and Python sides.",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./hmac": "./hmac-utils/ts/index.ts",
+    "./types": "./types/index.ts",
+    "./widget-config": "./types/widget-config.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  }
+}

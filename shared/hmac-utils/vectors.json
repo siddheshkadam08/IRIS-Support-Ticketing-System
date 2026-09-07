@@ -1,0 +1,23 @@
+{
+  "_comment": "Shared HMAC test vectors. Asserted by BOTH the TypeScript and (future) Python suites, so a cross-language divergence fails CI instead of surfacing at an integration boundary. These exact values are published to integrators in docs/api-contract.md §3.3 and §6.3 — changing one is a BREAKING CONTRACT CHANGE, not a refactor.",
+  "request_v1": {
+    "name": "canonical request signature",
+    "client_secret": "sk_test_51H9xQmKvB2nRtYwLpZaCdEfG",
+    "method": "POST",
+    "path": "/v1/tickets",
+    "timestamp": 1774483200,
+    "nonce": "5f2b8c1a-9d3e-4a7b-8c6f-2e1d0a9b8c7d",
+    "body": "{\"product_tenant_id\":\"acme-corp\",\"description\":\"Cannot export the Q3 emissions report — the download button returns a 500.\",\"category\":\"bug\",\"severity\":\"high\"}",
+    "body_bytes": 161,
+    "body_sha256": "3211c39bfe24338cf01e34cd42b53c72c62867f7fe1d6fca3010668655847058",
+    "canonical": "v1\nPOST\n/v1/tickets\n1774483200\n5f2b8c1a-9d3e-4a7b-8c6f-2e1d0a9b8c7d\n3211c39bfe24338cf01e34cd42b53c72c62867f7fe1d6fca3010668655847058",
+    "signature": "194eb588b7ad9e06cc477a5de3df4c06ae875d3c558dfa70d6465d65e1a293fb"
+  },
+  "webhook_v1": {
+    "name": "stripe-style webhook signature",
+    "webhook_secret": "whsec_7Kp2mXqR8vNtJdLwEaZbYcHgFuSi",
+    "timestamp": 1774486800,
+    "body": "{\"event_id\":\"evt_01JQZ8X4M2\",\"event\":\"ticket.assigned\",\"occurred_at\":\"2026-03-26T09:00:00Z\",\"data\":{\"ticket_id\":\"tkt_01JQZ7YB3K\",\"status\":\"assigned\"}}",
+    "signature": "700a642079f3141d0215ce07b0113ad9a885606706f08b3bc909aeba0bf81500"
+  }
+}

@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 AIFeature = Literal[
     "noop", "classification", "sentiment", "keywords", "summary", "rag", "embedding",
-    "reranking",
+    "reranking", "copilot",
 ]
 
 
@@ -117,6 +117,51 @@ class RagEvidence(Strict):
     excerpt: str
 
 
+class TicketComment(Strict):
+    """One PUBLIC comment on the current ticket.
+
+    `author` is a ROLE, not a person: no name, no email, no user id, no raiser
+    reference. The model needs to know who said what, not who they are.
+    """
+
+    author: Literal["customer", "support"]
+    body: str
+
+
+class TicketContext(Strict):
+    """The current ticket, Phase 15 Copilot only.
+
+    ⚠️ NOTE WHAT IS ABSENT AND MUST STAY ABSENT: ticket id, reference,
+    product_id, product_tenant_id, raiser identity, assignee, attachments,
+    metadata, audit history — and INTERNAL COMMENTS. An internal note is
+    "never leaves the platform" by the schema's own comment, and the surest way
+    to keep it out of a customer reply is to never put it in the prompt.
+    """
+
+    subject: str | None
+    description: str
+    status: str
+    category: str | None
+    severity: str | None
+    public_comments: list[TicketComment] = Field(default_factory=list, max_length=6)
+
+
+class CopilotEvidence(Strict):
+    """One already-authorized source, Phase 15.
+
+    Same identifier-free shape as Phase 12 and 13: the model cites source
+    NUMBERS, so naming a document Core did not supply is unrepresentable.
+
+    `kind` matters to the prompt — a help article is documented guidance, a past
+    ticket is one thing that happened once.
+    """
+
+    source_number: int = Field(ge=1, le=5)
+    kind: Literal["kb_article", "historical_ticket"]
+    title: str
+    excerpt: str
+
+
 class ExecuteInput(Strict):
     subject: str | None
     description: str
@@ -130,6 +175,9 @@ class ExecuteInput(Strict):
     # shape: the model cites source NUMBERS, so it cannot name a document Core
     # did not supply.
     evidence: list[RagEvidence] | None = Field(default=None, max_length=5)
+    # Phase 15 Copilot only. Same bounding and identifier-free rationale.
+    ticket_context: TicketContext | None = None
+    copilot_evidence: list[CopilotEvidence] | None = Field(default=None, max_length=5)
 
 
 class ExecuteRequest(Strict):

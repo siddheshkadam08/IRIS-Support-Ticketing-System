@@ -277,6 +277,27 @@ export interface SimilarTicketsResponse {
   };
 }
 
+export interface CopilotDraft {
+  /** Absent when no draft could be produced. The agent writes the reply. */
+  draft?: string;
+  /** 1-based indexes into `sources`. Never identifiers. */
+  citations: number[];
+  sources: Array<{ source_number: number; kind: 'kb_article' | 'historical_ticket'; title: string }>;
+  /** True when the draft cites nothing — read it harder before sending. */
+  insufficient: boolean;
+  outcome: string;
+  diagnostics: {
+    kb_evidence: number;
+    historical_evidence: number;
+    ticket_comments: number;
+    retrieval_ms: number;
+    generation_ms: number | null;
+    total_ms: number;
+    model: string | null;
+    prompt_version: string;
+  };
+}
+
 export const api = {
   login: (email: string, password: string) =>
     request<{ user: Me }>('POST', '/admin/api/auth/login', { email, password }),
@@ -299,6 +320,13 @@ export const api = {
    */
   similarTickets: (id: string) =>
     request<SimilarTicketsResponse>('GET', `/admin/api/tickets/${id}/similar`),
+  /**
+   * Phase 15 — generate a DRAFT reply. This does not send anything and creates
+   * no comment; sending is `comment()` below, which the agent must trigger
+   * separately after reviewing the text.
+   */
+  copilotDraft: (id: string) =>
+    request<CopilotDraft>('POST', `/admin/api/tickets/${id}/copilot/draft`),
   assign: (id: string, support_user_id: string) =>
     request<TicketDetail>('POST', `/admin/api/tickets/${id}/assign`, { support_user_id }),
   setStatus: (id: string, status: string, reason?: string) =>

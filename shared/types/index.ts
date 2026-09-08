@@ -14,3 +14,4 @@ export * from './retrieval.js';
 export * from './reranking.js';
 export * from './rag.js';
 export * from './similar-tickets.js';
+export * from './copilot.js';

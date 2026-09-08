@@ -38,6 +38,12 @@ export const ERROR_CODES = {
   internal_error: 500,
   service_unavailable: 503,
   deflection_unavailable: 503,
+  /**
+   * Phase 15. Copilot is off for this deployment. 503 rather than 403: it is a
+   * capability that is not running, not a permission the caller lacks — and an
+   * agent seeing "unavailable" knows to write the reply themselves.
+   */
+  copilot_disabled: 503,
 } as const;
 
 export type ErrorCode = keyof typeof ERROR_CODES;

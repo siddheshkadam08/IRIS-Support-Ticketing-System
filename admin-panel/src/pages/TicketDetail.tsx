@@ -3,6 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   api,
+  type CopilotDraft,
   type Delivery,
   type Grant,
   type SimilarTicket,
@@ -28,6 +29,20 @@ export default function TicketDetail() {
   const [reply, setReply] = useState('');
   const [internal, setInternal] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  /**
+   * Phase 15 — Copilot.
+   *
+   * `aiDraft` is the exact text Copilot last put in the box. Comparing it to
+   * `reply` is how we know whether the agent has edited since, which is what
+   * makes "regenerate" ask before it destroys their work.
+   *
+   * ⚠️ THE DRAFT LIVES ONLY HERE. Nothing is stored server-side, so there is no
+   * draft to send later, from another tab, or after discarding. Discarding is
+   * clearing this state. What reaches the customer is `reply` — whatever the
+   * human has in the box when they press Send.
+   */
+  const [aiDraft, setAiDraft] = useState<string | null>(null);
+  const [aiInfo, setAiInfo] = useState<CopilotDraft | null>(null);
 
   const { data: ticket, isLoading } = useQuery({
     queryKey: ['ticket', id],
@@ -71,11 +86,54 @@ export default function TicketDetail() {
     onSuccess: invalidate,
     onError: (e: Error) => setErr(e.message),
   });
+  /**
+   * Generating a draft creates NO comment and changes nothing about the
+   * ticket. It fills the reply box, and the agent takes it from there.
+   */
+  const copilot = useMutation({
+    mutationFn: () => api.copilotDraft(id!),
+    onSuccess: (res) => {
+      setAiInfo(res);
+      if (res.draft) {
+        setReply(res.draft);
+        setAiDraft(res.draft);
+      } else {
+        setAiDraft(null);
+      }
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  /** Has the agent changed the draft since Copilot wrote it? */
+  const edited = aiDraft !== null && reply !== aiDraft;
+
+  const runCopilot = () => {
+    /**
+     * ⚠️ NEVER SILENTLY DISCARD THE AGENT'S WORK. Regenerating over text they
+     * have written or edited requires them to say so.
+     */
+    const wouldOverwrite = reply.trim().length > 0 && (aiDraft === null || edited);
+    if (wouldOverwrite && !window.confirm('Replace what you have written with a new AI draft?')) {
+      return;
+    }
+    setErr(null);
+    copilot.mutate();
+  };
+
+  const discardDraft = () => {
+    // Local only. There is nothing on the server to discard.
+    setReply('');
+    setAiDraft(null);
+    setAiInfo(null);
+  };
+
   const comment = useMutation({
     mutationFn: () => api.comment(id!, reply, internal),
     onSuccess: () => {
       setReply('');
       setInternal(false);
+      setAiDraft(null);
+      setAiInfo(null);
       invalidate();
     },
     onError: (e: Error) => setErr(e.message),
@@ -212,6 +270,31 @@ export default function TicketDetail() {
                 onChange={(e) => setReply(e.target.value)}
                 placeholder={internal ? 'Internal note — never sent to the customer' : 'Reply to the customer…'}
               />
+              {/*
+                ⚠️ COPILOT FILLS THIS BOX. IT DOES NOT SEND.
+                The Send button below is the same one that existed before this
+                feature, and it posts whatever the agent has in the textarea —
+                so the customer receives the human's text, never the model's,
+                unless the human left it unchanged and chose to send it.
+              */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                <button
+                  className="btn btn-ghost"
+                  disabled={copilot.isPending || internal}
+                  onClick={runCopilot}
+                  title={internal ? 'Copilot drafts customer replies, not internal notes' : undefined}
+                >
+                  {copilot.isPending ? 'Drafting…' : aiDraft ? 'Regenerate' : 'Draft with AI'}
+                </button>
+                {aiInfo ? (
+                  <button className="btn btn-ghost" onClick={discardDraft} disabled={copilot.isPending}>
+                    Discard draft
+                  </button>
+                ) : null}
+              </div>
+
+              {aiInfo ? <CopilotNote info={aiInfo} edited={edited} /> : null}
+
               <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 10, flexWrap: 'wrap' }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5 }}>
                   <input type="checkbox" checked={internal} onChange={(e) => setInternal(e.target.checked)} />
@@ -365,6 +448,61 @@ export default function TicketDetail() {
       </div>
       <PageFooter />
     </>
+  );
+}
+
+/**
+ * What Copilot produced, and what it rested on.
+ *
+ * Deliberately plain and slightly discouraging: the agent is about to put this
+ * in front of a customer, so the panel says where it came from, flags when it
+ * cites nothing, and never implies the text is approved.
+ */
+function CopilotNote({ info, edited }: { info: CopilotDraft; edited: boolean }) {
+  const muted = { fontSize: 11.5, color: 'var(--muted)', lineHeight: 1.45 } as const;
+
+  if (!info.draft) {
+    const why =
+      info.outcome === 'no_evidence'
+        ? 'No related articles or past tickets were found, so there was nothing to ground a draft in.'
+        : 'The draft could not be generated just now.';
+    return (
+      <div style={{ ...muted, marginTop: 8 }}>
+        {why} Please write the reply yourself.
+      </div>
+    );
+  }
+
+  const cited = new Set(info.citations);
+  return (
+    <div style={{ ...muted, marginTop: 8 }}>
+      <div style={{ marginBottom: 4 }}>
+        AI draft — <strong>review and edit before sending</strong>.
+        {edited ? ' You have edited it.' : ''}
+      </div>
+      {info.insufficient ? (
+        <div style={{ marginBottom: 4 }}>
+          ⚠️ This draft cites no source. Check every factual claim in it.
+        </div>
+      ) : null}
+      {info.sources.length > 0 ? (
+        <div>
+          Based on:
+          <ul style={{ margin: '2px 0 0', paddingLeft: 18 }}>
+            {info.sources.map((s) => (
+              <li key={s.source_number} style={{ opacity: cited.has(s.source_number) ? 1 : 0.55 }}>
+                {s.title}
+                <span style={{ opacity: 0.75 }}>
+                  {' '}
+                  · {s.kind === 'kb_article' ? 'help article' : 'past ticket'}
+                  {cited.has(s.source_number) ? ' · cited' : ''}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

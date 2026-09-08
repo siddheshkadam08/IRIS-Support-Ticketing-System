@@ -325,6 +325,23 @@ const FEATURE_VALIDATORS: Record<
       code: 'unsupported_feature',
       message: 'reranking does not travel on the AI job queue',
     }),
+    /**
+     * ⚠️ Copilot must never arrive here, and this branch matters more than the
+     * others.
+     *
+     * The queue path APPLIES results to tickets. A draft reply is text for a
+     * human to review — if it ever reached a result handler it would be one
+     * step from being written somewhere. It runs inside an authenticated admin
+     * request, returns to a browser, and persists nothing.
+     *
+     * `verifyClaims` already rejects it, because `copilot` is deliberately
+     * absent from SUPPORTED_AI_FEATURES. This is the second lock.
+     */
+    copilot: () => ({
+      ok: false,
+      code: 'unsupported_feature',
+      message: 'copilot does not travel on the AI job queue',
+    }),
   };
 
 function notImplemented(feature: string) {

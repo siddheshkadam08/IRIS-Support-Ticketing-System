@@ -729,6 +729,7 @@ components:
                 - internal_error
                 - service_unavailable
                 - deflection_unavailable
+                - copilot_disabled
             message: { type: string }
             request_id: { type: string }
             details: { type: object, additionalProperties: true }

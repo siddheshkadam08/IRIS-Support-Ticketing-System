@@ -68,6 +68,7 @@ def test_ready_reports_loaded_features(client):
     assert body["status"] == "ready"
     assert body["features"] == [
         "classification",
+        "copilot",
         "embedding",
         "noop",
         "rag",
@@ -76,7 +77,8 @@ def test_ready_reports_loaded_features(client):
     ], (
         "readiness must report exactly what is built — the stub since Phase 1, "
         "classification since Phase 4, summary since Phase 5, embedding since "
-        "Phase 10, reranking since Phase 12, rag since Phase 13"
+        "Phase 10, reranking since Phase 12, rag since Phase 13, copilot since "
+        "Phase 15"
     )
 
 

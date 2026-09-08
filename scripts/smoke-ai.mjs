@@ -113,21 +113,26 @@ async function main() {
    * the same question as what Core is willing to dispatch.
    *
    * Phase 1 built the stub alone; Phase 4 added classification, Phase 5 added
-   * summary and Phase 10 added embedding. The feature gate that decides
-   * Phase 12 added reranking and Phase 13 added rag. The feature gate that decides
-   * whether classification actually runs lives in shared/types/ai.ts
+   * summary, Phase 10 added embedding, Phase 12 added reranking, Phase 13 added
+   * rag and Phase 15 added copilot. The feature gate that decides whether
+   * classification actually runs lives in shared/types/ai.ts
    * (SUPPORTED_AI_FEATURES), on the Core side, and is asserted separately
    * below.
    *
-   * ⚠️ `embedding` and `reranking` appearing HERE and being absent from
-   * SUPPORTED_AI_FEATURES
-   * is not an inconsistency — it is the design. The AI service implements the
-   * feature; the ai.jobs queue must never carry it, because it has its own
-   * route, validator and idempotency key. See shared/types/embedding.ts.
+   * ⚠️ `embedding`, `reranking`, `rag` and `copilot` appearing HERE and being
+   * absent from SUPPORTED_AI_FEATURES is not an inconsistency — it is the
+   * design. The AI service implements the feature; the ai.jobs queue must never
+   * carry it, because each has its own route, validator and idempotency key.
+   * See shared/types/embedding.ts.
+   *
+   * ⚠️ `copilot` matters most here. The queue path APPLIES results to tickets,
+   * and a draft customer reply must never reach a result handler — it is
+   * returned to an agent's browser and persisted nowhere.
    */
   check(
     'ai-service is ready and exposes exactly the features it implements',
-    aiReady.features?.slice().sort().join() === 'classification,embedding,noop,rag,reranking,summary',
+    aiReady.features?.slice().sort().join() ===
+      'classification,copilot,embedding,noop,rag,reranking,summary',
     `got: ${aiReady.features?.join() ?? '(none)'}`,
   );
 

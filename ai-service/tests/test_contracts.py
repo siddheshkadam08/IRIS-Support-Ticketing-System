@@ -81,15 +81,19 @@ def test_the_features_this_service_implements_are_declared_in_the_contract(schem
     declared = set(schema["$defs"]["ai_feature"]["enum"])
     assert set(FEATURES).issubset(declared)
     # Phase 1 implemented the stub alone; Phase 4 added classification, Phase 5
-    # added summary, Phase 10 added embedding, Phase 12 added reranking and
-    # Phase 13 added rag. The
-    # assertion that matters is
-    # unchanged and above: everything this service implements must be DECLARED
-    # in the shared contract.
+    # added summary, Phase 10 added embedding, Phase 12 added reranking,
+    # Phase 13 added rag and Phase 15 added copilot. The assertion that matters
+    # is unchanged and above: everything this service implements must be
+    # DECLARED in the shared contract.
     #
     # NOTE that `embedding` being declared here says nothing about the QUEUE.
     # It is deliberately absent from SUPPORTED_AI_FEATURES on the Core side,
     # because it travels on /internal/embeddings/* and never on ai.jobs.
+    #
+    # NOTE the same is true of `copilot`, and more sharply: the queue path
+    # APPLIES results to tickets, and a draft customer reply must never reach a
+    # result handler. It runs synchronously inside an authenticated admin
+    # request and persists nothing.
     assert set(FEATURES) == {
         "noop",
         "classification",
@@ -97,6 +101,7 @@ def test_the_features_this_service_implements_are_declared_in_the_contract(schem
         "embedding",
         "reranking",
         "rag",
+        "copilot",
     }
 
 

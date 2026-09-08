@@ -50,6 +50,12 @@ export const AI_FEATURES = [
    * travels on ai.jobs.
    */
   'reranking',
+  /**
+   * Phase 15. Drafts a customer reply for a human to review, edit and send.
+   * Absent from SUPPORTED_AI_FEATURES like every other synchronous feature —
+   * it runs inside an admin request and never travels on the ai.jobs queue.
+   */
+  'copilot',
 ] as const;
 export type AIFeature = (typeof AI_FEATURES)[number];
 

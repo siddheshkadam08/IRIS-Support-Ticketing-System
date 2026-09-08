@@ -176,6 +176,36 @@ const Env = z.object({
    * gets retrieval results — the answer is what is lost, not the search.
    */
   RAG_TIMEOUT_MS: z.coerce.number().int().min(1000).max(20_000).default(8000),
+
+  /**
+   * Phase 15 — Agent Copilot, ON BY DEFAULT.
+   *
+   * ⚠️ THE ONLY AI FEATURE SO FAR THAT DEFAULTS ON, and the reason is who asks
+   * for it. Classification, summary, reranking and RAG all run on somebody
+   * else's request — a ticket arriving, a user searching — so their latency is
+   * spent without anyone choosing to spend it, which is why they default off.
+   *
+   * A Copilot draft happens because an agent pressed "Draft with AI" and is
+   * watching a spinner they asked for. Nothing is generated until they click,
+   * so the feature costs exactly nothing until it is wanted.
+   *
+   * It still cannot send anything: drafting and sending are different
+   * endpoints, and only the second creates a comment.
+   */
+  COPILOT_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v !== 'false' && v !== '0'),
+
+  /**
+   * Hard bound on generation.
+   *
+   * The most generous budget in the platform, because this writes a full reply
+   * — output tokens dominate generation time — and because an agent explicitly
+   * asked for it. Past it, the agent is told the draft is unavailable and
+   * writes the reply themselves; nothing is left half-written.
+   */
+  COPILOT_TIMEOUT_MS: z.coerce.number().int().min(1000).max(30_000).default(15_000),
 });
 
 const parsed = Env.safeParse(process.env);

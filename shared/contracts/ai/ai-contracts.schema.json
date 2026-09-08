@@ -15,7 +15,8 @@
         "summary",
         "rag",
         "embedding",
-        "reranking"
+        "reranking",
+        "copilot"
       ]
     },
     "ai_job": {
@@ -372,6 +373,104 @@
                     "enum": [
                       "kb_article",
                       "resolved_ticket"
+                    ]
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "excerpt": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "ticket_context": {
+              "description": "Phase 15 Copilot only. The current ticket as the agent is authorized to see it. Carries NO internal comments, no raiser identity, no ids and no tenant identifiers.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "subject",
+                "description",
+                "status",
+                "category",
+                "severity",
+                "public_comments"
+              ],
+              "properties": {
+                "subject": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "description": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "category": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "severity": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "public_comments": {
+                  "type": "array",
+                  "maxItems": 6,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "author",
+                      "body"
+                    ],
+                    "properties": {
+                      "author": {
+                        "type": "string",
+                        "enum": [
+                          "customer",
+                          "support"
+                        ]
+                      },
+                      "body": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "copilot_evidence": {
+              "description": "Phase 15 Copilot only. Evidence Core has ALREADY authorized, numbered 1..N. No source_id, product_id, reference or tenant identifier: the model cites source NUMBERS.",
+              "type": "array",
+              "maxItems": 5,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "source_number",
+                  "kind",
+                  "title",
+                  "excerpt"
+                ],
+                "properties": {
+                  "source_number": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "kb_article",
+                      "historical_ticket"
                     ]
                   },
                   "title": {

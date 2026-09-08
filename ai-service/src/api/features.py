@@ -29,6 +29,7 @@ from .summary import (
 from .summary import build_system_prompt as build_summary_system_prompt
 from .summary import build_user_prompt as build_summary_user_prompt
 from .embedding import run_embedding
+from .copilot import run_copilot
 from .rag import run_rag
 from .reranking import run_reranking
 from .schemas import AIResult, ExecuteRequest
@@ -357,4 +358,7 @@ FEATURES: dict[str, Callable[[ExecuteRequest], Any]] = {
     # set and cites source NUMBERS, so it cannot name a document Core did not
     # supply.
     "rag": run_rag,
+    # Phase 15. Drafts a customer reply for a human to review, edit and send.
+    # It returns TEXT — this service cannot send anything to anyone.
+    "copilot": run_copilot,
 }

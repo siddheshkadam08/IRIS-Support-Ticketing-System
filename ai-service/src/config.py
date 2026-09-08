@@ -160,6 +160,13 @@ class Config:
         # enough that falling back to plain retrieval is still a fast answer.
         self.rag_budget_seconds: float = float(env.get("RAG_BUDGET_SECONDS", "6"))
 
+        # Phase 15: Copilot writes a full customer reply, so it generates more
+        # output tokens than any other feature here — and output tokens
+        # dominate generation time. An agent has explicitly asked for it and is
+        # watching a spinner, which buys more patience than a widget search
+        # does, but not unlimited patience.
+        self.copilot_budget_seconds: float = float(env.get("COPILOT_BUDGET_SECONDS", "12"))
+
         # ── Phase 10: embeddings ─────────────────────────────────────────
         #
         # A SEPARATE deployment from the chat one, and therefore separate

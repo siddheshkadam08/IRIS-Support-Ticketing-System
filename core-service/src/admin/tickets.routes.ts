@@ -14,6 +14,8 @@ import {
 } from '../tickets/ticket.repo.js';
 import { deliveriesForTicket, grantsForTicket, issueGrants, revokeGrants } from '../access/grant.service.js';
 import { findSimilar } from '../tickets/similar.service.js';
+import { draftReply } from '../tickets/copilot.service.js';
+import { config } from '../config.js';
 import { assertTenant, requireRole, resolveAdminCaller } from './admin.context.js';
 
 const AssignBody = z.object({ support_user_id: z.string().min(1) });
@@ -325,6 +327,71 @@ export async function adminTicketRoutes(app: FastifyInstance): Promise<void> {
       );
 
       return (await findTicket(tx, ticket.id))!;
+    });
+  });
+
+  // ── POST /admin/tickets/:id/copilot/draft ──────────────────────────────
+  //
+  // ⚠️ THIS DOES NOT SEND ANYTHING, AND CANNOT.
+  //
+  // It returns draft text to the agent's browser. Creating a customer-facing
+  // comment is POST /admin/api/tickets/:id/comments below — a different
+  // endpoint, requiring the same authenticated support user to act again. This
+  // route writes no comment, changes no ticket state, and persists no draft.
+  //
+  // POST rather than GET because it is not cacheable and it spends money on a
+  // provider call; it is still read-only with respect to IRIS state.
+  app.post<{ Params: { id: string } }>('/admin/api/tickets/:id/copilot/draft', async (req) => {
+    const caller = resolveAdminCaller(req);
+    if (!config.COPILOT_ENABLED) {
+      throw new AppError('copilot_disabled', 'Copilot is not enabled for this deployment.');
+    }
+
+    return withScope(caller.scope, async (tx) => {
+      const result = await draftReply(tx, {
+        ticketId: req.params.id,
+        requestId: caller.scope.requestId,
+      });
+
+      // null means the ticket is not visible under this scope. 404 rather than
+      // 403, so an unauthorized id cannot be used to probe for existence.
+      if (!result) throw notFound();
+
+      /**
+       * ⚠️ AUDITED, unlike the Phase 14 similar-tickets read.
+       *
+       * Nothing changed in IRIS, so this is not a state transition — but the
+       * ticket's text was sent to a third-party provider and content was
+       * generated that a human may put in front of a customer. That is worth a
+       * durable record even though no row changed, and it is the provenance
+       * trail for "where did this reply come from?".
+       *
+       * METADATA ONLY. Never the draft, the ticket body or any evidence text.
+       * Attached to the ticket so it appears in that ticket's history, which is
+       * where someone would look.
+       */
+      await writeAudit(tx, caller.scope, {
+        action: 'ai.copilot_drafted',
+        entityType: 'ticket',
+        entityId: req.params.id,
+        after: {
+          outcome: result.outcome,
+          kb_evidence: result.diagnostics.kb_evidence,
+          historical_evidence: result.diagnostics.historical_evidence,
+          citations: result.citations.length,
+          draft_chars: result.draft?.length ?? 0,
+          model: result.diagnostics.model,
+          prompt_version: result.diagnostics.prompt_version,
+        },
+        sourceIp: req.ip,
+      });
+
+      req.log.info(
+        { request_id: caller.scope.requestId, outcome: result.outcome, ...result.diagnostics },
+        'copilot draft',
+      );
+
+      return result;
     });
   });
 

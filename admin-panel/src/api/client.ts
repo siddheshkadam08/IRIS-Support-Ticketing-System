@@ -251,6 +251,32 @@ export interface Dashboard {
   revoke_failures: number;
 }
 
+export interface SimilarTicket {
+  reference: string;
+  title: string;
+  status: 'resolved' | 'closed';
+  /**
+   * Cosine similarity in [0,1]. READ COMPARATIVELY, NOT ABSOLUTELY — it is a
+   * raw retrieval score, not a probability that the two tickets share a cause.
+   */
+  similarity: number;
+  /** Last PUBLIC support reply. Null when none was recorded. Never internal. */
+  resolution: string | null;
+  resolved_at: string | null;
+}
+
+export interface SimilarTicketsResponse {
+  items: SimilarTicket[];
+  diagnostics: {
+    corpus: number;
+    returned: number;
+    embed_ms: number | null;
+    retrieval_ms: number;
+    rerank_ms: number | null;
+    outcome: string;
+  };
+}
+
 export const api = {
   login: (email: string, password: string) =>
     request<{ user: Me }>('POST', '/admin/api/auth/login', { email, password }),
@@ -267,6 +293,12 @@ export const api = {
       `/admin/api/tickets${qs ? `?${qs}` : ''}`,
     ),
   ticket: (id: string) => request<TicketDetail>('GET', `/admin/api/tickets/${id}`),
+  /**
+   * Phase 14 — historical tickets resembling this one. Read-only; changes
+   * nothing about the ticket.
+   */
+  similarTickets: (id: string) =>
+    request<SimilarTicketsResponse>('GET', `/admin/api/tickets/${id}/similar`),
   assign: (id: string, support_user_id: string) =>
     request<TicketDetail>('POST', `/admin/api/tickets/${id}/assign`, { support_user_id }),
   setStatus: (id: string, status: string, reason?: string) =>

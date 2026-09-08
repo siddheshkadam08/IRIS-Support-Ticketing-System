@@ -269,5 +269,87 @@ console.log('\nRate limiting');
   ok('the /v1/widget/ask bucket throttles (10/min)', limited);
 }
 
+await cleanup();
+
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);
+
+/**
+ * Remove the tickets this run created.
+ *
+ * WHY THIS EXISTS. This suite raises REAL tickets through the real route.
+ * Without cleanup they accumulate run after run - and because Phase 10 embeds
+ * every resolved ticket, they end up in the SIMILAR-TICKETS corpus. By the time
+ * Phase 14 audited it, 30 of prod_carbon's 43 historical tickets were smoke
+ * artifacts, each having also consumed a real embedding call.
+ *
+ * They are indistinguishable from production tickets to every query in the
+ * platform, which is exactly why the suite has to clean up after itself rather
+ * than every consumer learning to ignore them. Same lesson as the Phase 5 queue
+ * debris, and the same fix: delete what you made.
+ *
+ * Scoped to THIS run's SMOKE_SUB, so a concurrent run is untouched.
+ *
+ * RLS applies here too: connecting as `iris_app` with no scope GUCs makes every
+ * row invisible and the DELETE matches nothing, silently. SET LOCAL inside a
+ * transaction, mirroring withSystemScope().
+ */
+async function cleanup() {
+  const env = await readEnvFile();
+  const url = process.env.CORE_DATABASE_URL ?? env.CORE_DATABASE_URL;
+  if (!url) {
+    console.warn('  [smoke-cleanup] no CORE_DATABASE_URL - skipping');
+    return;
+  }
+  let pg;
+  try {
+    pg = (await import('pg')).default;
+  } catch {
+    console.warn('  [smoke-cleanup] pg unavailable - skipping');
+    return;
+  }
+  const client = new pg.Client({ connectionString: url, application_name: 'iris-smoke-cleanup' });
+  try {
+    await client.connect();
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT set_config('app.role','super_admin',true),
+              set_config('app.product_scope','',true),
+              set_config('app.request_id','smoke-cleanup',true)`,
+    );
+    // comment and attachment rows cascade from ticket.
+    const r = await client.query(`DELETE FROM ticket WHERE raised_by_ref = $1`, [SMOKE_SUB]);
+    await client.query('COMMIT');
+    console.log(`  [smoke-cleanup] removed ${r.rowCount ?? 0} ticket(s) created by this run`);
+  } catch (err) {
+    // Cleanup must never fail a run that otherwise passed - but it IS reported,
+    // because silent cleanup is how the debris accumulated in the first place.
+    console.warn('  [smoke-cleanup] failed:', err instanceof Error ? err.message : err);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Minimal .env reader - this script otherwise needs no configuration.
+ *
+ * `await import`, not `require`: this is an ES module, so `require` is not
+ * defined and the call threw straight into the catch below - which reported
+ * "no CORE_DATABASE_URL" and skipped cleanup silently. Exactly the failure
+ * mode the Phase 5 teardown warned about, so the catch now says which.
+ */
+async function readEnvFile() {
+  try {
+    const fs = await import('node:fs');
+    return Object.fromEntries(
+      fs
+        .readFileSync('.env', 'utf8')
+        .split(/\r?\n/)
+        .filter((l) => /^[A-Z_]+=/.test(l))
+        .map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]),
+    );
+  } catch (err) {
+    console.warn('  [smoke-cleanup] could not read .env:', err instanceof Error ? err.message : err);
+    return {};
+  }
+}

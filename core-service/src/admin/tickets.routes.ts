@@ -13,6 +13,7 @@ import {
   updateStatus,
 } from '../tickets/ticket.repo.js';
 import { deliveriesForTicket, grantsForTicket, issueGrants, revokeGrants } from '../access/grant.service.js';
+import { findSimilar } from '../tickets/similar.service.js';
 import { assertTenant, requireRole, resolveAdminCaller } from './admin.context.js';
 
 const AssignBody = z.object({ support_user_id: z.string().min(1) });
@@ -159,6 +160,50 @@ export async function adminTicketRoutes(app: FastifyInstance): Promise<void> {
 
   // ── POST /admin/tickets/:id/assign ─────────────────────────────────────
   // The transition that fires the dual JIT grant.
+  // ── GET /admin/tickets/:id/similar ─────────────────────────────────────
+  //
+  // "Have we seen this before, and what happened?"
+  //
+  // ⚠️ READ-ONLY. No write, no state transition, no audit event — nothing
+  // auditable happened. Fabricating one to make the feature look governed
+  // would put noise into an append-only compliance log.
+  //
+  // Scope comes from `caller.scope` as every admin route does, and the
+  // PRODUCT comes from the ticket row itself — a caller cannot name a product,
+  // so cannot ask for similarity inside someone else's.
+  app.get<{ Params: { id: string } }>('/admin/api/tickets/:id/similar', async (req) => {
+    const caller = resolveAdminCaller(req);
+    const q = req.query as Record<string, string | undefined>;
+    const limit = Number(q.limit) || undefined;
+
+    return withScope(caller.scope, async (tx) => {
+      const result = await findSimilar(tx, {
+        ticketId: req.params.id,
+        limit,
+        requestId: caller.scope.requestId,
+        // Optional narrowing for a genuinely tenant-bound caller. Omitted for
+        // support staff, who serve the whole product — matching the behaviour
+        // of GET /admin/api/tickets above.
+        productTenantId: q.product_tenant_id ?? null,
+      });
+
+      // null means the ticket is not visible under this scope. 404 rather than
+      // 403, so an unauthorized id cannot be used to probe for existence.
+      if (!result) throw notFound();
+
+      /**
+       * Bounded, non-sensitive diagnostics. NOT LOGGED: ticket text, resolution
+       * text, references, or any customer content.
+       */
+      req.log.info(
+        { request_id: caller.scope.requestId, ...result.diagnostics },
+        'similar tickets',
+      );
+
+      return result;
+    });
+  });
+
   app.post<{ Params: { id: string } }>('/admin/api/tickets/:id/assign', async (req) => {
     const caller = resolveAdminCaller(req);
     const body = AssignBody.parse(req.body);

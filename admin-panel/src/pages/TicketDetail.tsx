@@ -1,7 +1,13 @@
 import { useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, type Delivery, type Grant, type TicketDetail as TDetail } from '../api/client';
+import {
+  api,
+  type Delivery,
+  type Grant,
+  type SimilarTicket,
+  type TicketDetail as TDetail,
+} from '../api/client';
 import { useAuth } from '../auth/AuthContext';
 import { Banner, Card, Empty, PageFooter, Pill, Spinner, TenantChip } from '../components/ui';
 import { ACTION_LABEL, absTime, relTime } from '../lib/labels';
@@ -31,6 +37,23 @@ export default function TicketDetail() {
   });
 
   const { data: users } = useQuery({ queryKey: ['users'], queryFn: api.users });
+
+  /**
+   * Phase 14 — historical tickets resembling this one.
+   *
+   * Deliberately NOT on `refetchInterval` like the ticket itself: the history
+   * does not change while someone reads it, and each call costs a real
+   * embedding request. Failure is silent by design — this is a supporting
+   * panel, and a support user must never be blocked from working a ticket
+   * because an optional lookup could not reach the provider.
+   */
+  const { data: similar, isLoading: similarLoading } = useQuery({
+    queryKey: ['ticket-similar', id],
+    queryFn: () => api.similarTickets(id!),
+    enabled: Boolean(id),
+    retry: false,
+    staleTime: 60_000,
+  });
 
   const invalidate = () => {
     void qc.invalidateQueries({ queryKey: ['ticket', id] });
@@ -304,7 +327,7 @@ export default function TicketDetail() {
             </Card>
           ) : null}
 
-          <Card title={`Access grants (${ticket.grants.length})`}>
+          <Card title={`Access grants (${ticket.grants.length})`} style={{ marginBottom: 14 }}>
             {ticket.grants.length === 0 ? (
               <div style={{ fontSize: 12.5, color: 'var(--muted)' }}>
                 None yet. Grants are issued on assignment.
@@ -313,10 +336,76 @@ export default function TicketDetail() {
               ticket.grants.map((g) => <GrantCard key={g.id} grant={g} deliveries={ticket.deliveries} />)
             )}
           </Card>
+
+          <Card title="Similar tickets">
+            {similarLoading ? (
+              <div style={{ fontSize: 12.5, color: 'var(--muted)' }}>Looking for precedents…</div>
+            ) : !similar || similar.items.length === 0 ? (
+              <div style={{ fontSize: 12.5, color: 'var(--muted)' }}>
+                No resolved tickets to compare against yet.
+              </div>
+            ) : (
+              <>
+                {similar.items.map((t) => (
+                  <SimilarCard key={t.reference} item={t} onOpen={() => nav(`/tickets?q=${t.reference}`)} />
+                ))}
+                {/*
+                  ⚠️ Says what the list IS. These are past tickets that read
+                  alike, not a recommendation — a similar ticket's fix may be
+                  wrong for this one, and the reader has to decide that.
+                */}
+                <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 8, lineHeight: 1.4 }}>
+                  Past tickets that resemble this one. Similarity is a retrieval
+                  score, not a verdict — check before reusing a resolution.
+                </div>
+              </>
+            )}
+          </Card>
         </div>
       </div>
       <PageFooter />
     </>
+  );
+}
+
+/**
+ * One historical ticket.
+ *
+ * Shows only what the support user needs to judge it: reference, subject,
+ * status, similarity, what happened and when. No internal ids, no product or
+ * tenant identifiers, no internal comments.
+ */
+function SimilarCard({ item, onOpen }: { item: SimilarTicket; onOpen: () => void }) {
+  return (
+    <button
+      onClick={onOpen}
+      style={{
+        display: 'block', width: '100%', textAlign: 'left', cursor: 'pointer',
+        background: 'var(--card)', border: '1px solid var(--border)',
+        borderRadius: 8, padding: '8px 10px', marginBottom: 8,
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'baseline' }}>
+        <span style={{ fontWeight: 600, fontSize: 12.5 }}>{item.reference}</span>
+        <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+          {Math.round(item.similarity * 100)}% match
+        </span>
+      </div>
+      <div style={{ fontSize: 12.5, margin: '2px 0 4px' }}>{item.title}</div>
+      {item.resolution ? (
+        <div style={{ fontSize: 11.5, color: 'var(--muted)', lineHeight: 1.4 }}>
+          {item.resolution.length > 150 ? `${item.resolution.slice(0, 149)}…` : item.resolution}
+        </div>
+      ) : (
+        <div style={{ fontSize: 11.5, color: 'var(--muted)', fontStyle: 'italic' }}>
+          No public resolution recorded.
+        </div>
+      )}
+      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+        {item.status}
+        {item.resolved_at ? ` · ${absTime(item.resolved_at)}` : ''}
+      </div>
+    </button>
   );
 }
 

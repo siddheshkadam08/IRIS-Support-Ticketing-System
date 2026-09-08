@@ -13,3 +13,4 @@ export * from './embedding.js';
 export * from './retrieval.js';
 export * from './reranking.js';
 export * from './rag.js';
+export * from './similar-tickets.js';

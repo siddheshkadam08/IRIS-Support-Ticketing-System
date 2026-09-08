@@ -10,7 +10,7 @@ import json
 import time
 import uuid
 
-from conftest import TEST_SECRET
+from conftest import CORE_TEST_SECRET, TEST_SECRET
 from iris_hmac import request_signature_header
 
 
@@ -66,7 +66,17 @@ def test_ready_reports_loaded_features(client):
     assert res.status_code == 200
     body = res.json()
     assert body["status"] == "ready"
-    assert body["features"] == ["noop"], "Phase 1 must expose the stub and nothing else"
+    assert body["features"] == [
+        "classification",
+        "embedding",
+        "noop",
+        "reranking",
+        "summary",
+    ], (
+        "readiness must report exactly what is built — the stub since Phase 1, "
+        "classification since Phase 4, summary since Phase 5, embedding since "
+        "Phase 10, reranking since Phase 12"
+    )
 
 
 # ── the stub ─────────────────────────────────────────────────────────────
@@ -113,9 +123,15 @@ def test_whitespace_only_description_is_also_invalid(client):
 
 
 def test_declared_but_unbuilt_feature_is_permanent(client):
-    """`classification` is in the shared contract but not in this phase."""
+    """A feature in the shared contract but not built here fails permanently.
+
+    The example has moved as capabilities landed — `classification` (Phase 4),
+    then `summary` (Phase 5). `sentiment` carries the same meaning today:
+    declared in the contract, not implemented in this service. The assertion
+    itself is unchanged.
+    """
     payload = noop_request()
-    payload["feature"] = "classification"
+    payload["feature"] = "sentiment"
     res = _execute(client, payload)
     assert res.status_code == 422
     err = res.json()["error"]
@@ -178,6 +194,43 @@ def test_unsigned_request_is_rejected(client):
 def test_wrong_secret_is_rejected(client):
     res = _execute(client, noop_request(), secret="a-completely-different-secret")
     assert res.status_code == 401
+
+
+class TestCallerAllowlist:
+    """Phase 11 — core-service became a second permitted caller.
+
+    Hybrid retrieval needs a query embedding on a synchronous user request,
+    where the worker is not on the path. Adding a caller is only safe if the
+    two credentials stay SEPARATE, so these tests assert the separation rather
+    than the feature.
+    """
+
+    def test_core_may_call_with_its_OWN_secret(self, client):
+        res = _execute(client, noop_request(), service_id="core", secret=CORE_TEST_SECRET)
+        assert res.status_code == 200
+
+    def test_the_worker_still_works_unchanged(self, client):
+        res = _execute(client, noop_request(), service_id="worker", secret=TEST_SECRET)
+        assert res.status_code == 200
+
+    def test_CORE_CANNOT_USE_THE_WORKER_SECRET(self, client):
+        """The point of two secrets, asserted.
+
+        If this passed, the credentials would be interchangeable and leaking
+        either would grant the other's access — which is exactly the
+        escalation key separation exists to prevent.
+        """
+        res = _execute(client, noop_request(), service_id="core", secret=TEST_SECRET)
+        assert res.status_code == 401
+
+    def test_THE_WORKER_CANNOT_USE_THE_CORE_SECRET(self, client):
+        res = _execute(client, noop_request(), service_id="worker", secret=CORE_TEST_SECRET)
+        assert res.status_code == 401
+
+    def test_an_unknown_caller_is_rejected_even_with_a_valid_secret(self, client):
+        # A closed map, not a lookup with a fallback.
+        res = _execute(client, noop_request(), service_id="gateway", secret=TEST_SECRET)
+        assert res.status_code == 401
 
 
 def test_unknown_service_id_is_rejected(client):

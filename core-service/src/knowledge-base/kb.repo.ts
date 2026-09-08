@@ -102,45 +102,15 @@ export async function voteHelpful(tx: Tx, id: string, helpful: boolean): Promise
 }
 
 /**
- * Past resolved tickets as a second retrieval corpus — often a better answer
- * than a KB article, because someone already hit this exact problem.
- * Only resolved/closed tickets, and only the resolution comment is surfaced.
+ * ⚠️ `searchResolvedTickets` WAS REMOVED IN PHASE 11, not lost.
+ *
+ * Its job — ranking resolved tickets as a second retrieval corpus — is now done
+ * by core-service/src/retrieval/hybrid.repo.ts, alongside FTS, trigram and
+ * vector, in one fused ranking.
+ *
+ * It also had a real defect that the move fixed. It required a public assignee
+ * comment but applied that rule in JavaScript AFTER the query
+ * (`rows.filter(r => r.resolution)`), so `LIMIT 3` could return one row, or
+ * none, with nothing to indicate why. The rule is now a predicate, so the limit
+ * means what it says and all three strategies see one corpus.
  */
-export async function searchResolvedTickets(
-  tx: Tx,
-  query: string,
-  limit = 3,
-): Promise<Array<{ id: string; title: string; excerpt: string; score: number }>> {
-  const q = query.trim();
-  if (!q) return [];
-
-  const { rows } = await tx.query<{
-    id: string;
-    reference: string;
-    subject: string | null;
-    description: string;
-    resolution: string | null;
-    score: number;
-  }>(
-    `SELECT t.id, t.reference, t.subject, t.description,
-            (SELECT c.body FROM comment c
-              WHERE c.ticket_id = t.id AND c.is_internal = false AND c.author_type = 'assignee'
-              ORDER BY c.created_at DESC LIMIT 1) AS resolution,
-            ts_rank(t.search_tsv, websearch_to_tsquery('english', $1)) AS score
-       FROM ticket t
-      WHERE t.status IN ('resolved','closed')
-        AND t.search_tsv @@ websearch_to_tsquery('english', $1)
-      ORDER BY score DESC
-      LIMIT $2`,
-    [q, limit],
-  );
-
-  return rows
-    .filter((r) => r.resolution)
-    .map((r) => ({
-      id: r.id,
-      title: r.subject ?? `${r.reference} — similar issue`,
-      excerpt: excerpt(r.resolution!),
-      score: Number(r.score),
-    }));
-}

@@ -86,6 +86,7 @@ export async function widgetRoutes(app: FastifyInstance): Promise<void> {
         question: body.question,
         conversationId: body.conversation_id ?? null,
         config: caller.product.config ?? {},
+        requestId: caller.scope.requestId,
       }),
     );
   });

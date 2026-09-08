@@ -24,11 +24,26 @@
  */
 export const AI_FEATURES = [
   'noop', // Phase 1 stub. Proves the pipeline; touches no ticket state.
-  'classification', // Phase 7
+  'classification', // Phase 4 — controlled enablement
   'sentiment', // Phase 9
   'keywords', // Phase 9
-  'summary', // Phase 9
+  'summary', // Phase 5 — informational enrichment, no business authority
   'rag', // Phase 13
+  /**
+   * Phase 10. Present here because the worker's structural AIResult check and
+   * the /v1/execute contract are shared by every capability — but deliberately
+   * ABSENT from SUPPORTED_AI_FEATURES below, because embedding does not travel
+   * on the ai.jobs queue at all. See shared/types/embedding.ts for why.
+   */
+  'embedding',
+  /**
+   * Phase 12. Present here for the same reason `embedding` is — the worker's
+   * structural AIResult check and the /v1/execute contract are shared by every
+   * capability — and absent from SUPPORTED_AI_FEATURES for the same reason
+   * too: reranking is a synchronous step inside a search request and never
+   * travels on ai.jobs.
+   */
+  'reranking',
 ] as const;
 export type AIFeature = (typeof AI_FEATURES)[number];
 
@@ -37,7 +52,45 @@ export type AIFeature = (typeof AI_FEATURES)[number];
  * AI_FEATURES. A job naming a declared-but-unbuilt feature is a PERMANENT
  * error, not something to retry five times.
  */
-export const SUPPORTED_AI_FEATURES: readonly AIFeature[] = ['noop'];
+/**
+ * PHASE 4: `classification` is ENABLED, for CONTROLLED REVIEW.
+ *
+ * Validated against the real provider (Azure OpenAI, deployment gpt-4.1):
+ * 23/24 calls succeeded, p95 5218ms inside the 6s gate, zero invented taxonomy
+ * values, and Core's deterministic engine proven authoritative in both
+ * directions — a ticket shouting "URGENT CRITICAL EMERGENCY" was scored Low,
+ * and one insisting it was a "minor issue" while 500 users were locked out was
+ * scored High.
+ *
+ * ⚠️ ENABLED DOES NOT MEAN AUTO-ROUTING.
+ *
+ * The model's confidence is SELF-REPORTED and uncalibrated: it returned >=0.95
+ * on most tickets, which put 21 of 23 into AUTO_ROUTE under the default
+ * thresholds. High measured accuracy is not evidence that the confidence
+ * SIGNAL discriminates — those are different claims, and only the second would
+ * justify unattended routing.
+ *
+ * So the initial rollout raises `ai_thresholds.auto_route_p1` above 1.0 per
+ * product, making AUTO_ROUTE unreachable while the whole pipeline still runs.
+ * Every classification persists as `ai_uncertain` for human review. That uses
+ * the per-product configuration that already existed rather than adding a
+ * shadow-mode flag, table or service.
+ *
+ * Lower it once real accept/reject data shows the thresholds separate correct
+ * classifications from incorrect ones.
+ */
+/**
+ * ⚠️ NEITHER `embedding` NOR `reranking` IS HERE, and that is a security
+ * decision rather than an oversight.
+ *
+ * This list gates what `/internal/ai/jobs/:eventId/result` will accept. The
+ * embedding path has its own route, its own validator and its own idempotency
+ * key (a content fingerprint, not an event id). Listing it here would let a
+ * queue job claim `feature: "embedding"` and reach a result handler that has
+ * no validator for it — a permanent error at best, and at worst a shape nobody
+ * checked being written somewhere. Phase 10 tests assert it stays absent.
+ */
+export const SUPPORTED_AI_FEATURES: readonly AIFeature[] = ['noop', 'classification', 'summary'];
 
 export function isSupportedFeature(v: unknown): v is AIFeature {
   return typeof v === 'string' && (SUPPORTED_AI_FEATURES as readonly string[]).includes(v);
@@ -54,7 +107,18 @@ export const AI_QUEUE_NAME = 'ai.jobs';
  * across a query. Phase 1 wires ticket.created to the stub and nothing else.
  */
 export const AI_EVENT_FEATURES: Readonly<Record<string, readonly AIFeature[]>> = {
-  'ticket.created': ['noop'],
+  /**
+   * A new ticket fans out to every AI capability at once.
+   *
+   * They succeed or fail INDEPENDENTLY — UNIQUE(event_id, feature) keys them
+   * apart, so each gets its own execution row, retry budget, audit trail and
+   * replay. A summary failure cannot cost a ticket its classification, and
+   * neither can disturb the Phase 1 pipeline proof.
+   *
+   * This is why Phase 5 added a feature rather than two fields on the
+   * classification payload: shared failure was the thing to avoid.
+   */
+  'ticket.created': ['noop', 'classification', 'summary'],
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -132,6 +196,15 @@ export interface AITicketInput {
 export interface AITaxonomy {
   categories: Array<{ value: string; label: string }>;
   severities: string[];
+  /**
+   * Phase 4 classification vocabularies. Always populated by Core — the
+   * product's own values, or the platform defaults when it configures none.
+   *
+   * `core_categories` is deliberately NOT here: it feeds Core's deterministic
+   * priority engine and Python cannot use it, so it never crosses the boundary.
+   */
+  issue_types: string[];
+  impacts: string[];
 }
 
 /** From product.config.ai_thresholds merged over the ADR-005 defaults. */

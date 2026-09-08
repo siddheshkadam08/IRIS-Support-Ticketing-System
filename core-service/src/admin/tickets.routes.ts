@@ -115,8 +115,23 @@ export async function adminTicketRoutes(app: FastifyInstance): Promise<void> {
         [ticket.id],
       );
 
+      /**
+       * Phase 4: the AI's own record of how it classified this ticket.
+       *
+       * Read HERE rather than added to TicketDTO on purpose. That DTO is the
+       * product-facing /v1 contract, and model output — rationale, sentiment,
+       * per-field confidences — is internal triage material for support staff,
+       * not something to start returning to every integrating product as a
+       * side effect of a UI change.
+       */
+      const { rows: aiRows } = await tx.query<{ ai_classification: unknown }>(
+        `SELECT ai_classification FROM ticket WHERE id = $1`,
+        [ticket.id],
+      );
+
       return {
         ...ticket,
+        ai_classification: aiRows[0]?.ai_classification ?? null,
         tenant: {
           id: tenantRows[0]?.product_id ?? null,
           name: tenantRows[0]?.name ?? null,

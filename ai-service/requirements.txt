@@ -10,14 +10,22 @@
 #     connection is a second, unpoliced path to the data (ADR-007).
 #
 # ALSO ABSENT until their phase arrives — no speculative dependencies:
-#   sentence-transformers, scikit-learn, torch, numpy, any provider SDK.
+#   sentence-transformers, scikit-learn, torch, numpy.
+#
+# The provider SDK arrived in Phase 4 (openai, below) — that "until their phase
+# arrives" caveat, honoured.
 
 fastapi==0.115.6
 uvicorn==0.34.0
 pydantic==2.10.4
 structlog==24.4.0
 
-# Test-only
 pytest==8.3.4
+# Phase 4: ALSO the provider transport, not just a test client.
+#
+# The `openai` SDK was the obvious choice and was rejected: 1.6.1 passes
+# `proxies=` to httpx, which httpx 0.28 removed, and the SDK retries twice by
+# default — a hidden second retry owner one careless upgrade away from
+# reappearing. One OpenAI-compatible POST needs neither.
 httpx==0.28.1
 jsonschema==4.23.0

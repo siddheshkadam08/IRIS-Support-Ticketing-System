@@ -13,8 +13,23 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from typing import Any
 
 from ..config import config
+
+# Mirrors SUMMARY_TARGET_WORDS in shared/types/summary.ts — the prompt target,
+# deliberately well inside the hard ceiling Core enforces.
+SUMMARY_TARGET_WORDS = 40
+from .classification_schema import ClassificationSchemaError, build_classification_schema
+from .prompts import PROMPT_VERSION, build_system_prompt, build_user_prompt
+from .summary import (
+    SUMMARY_PROMPT_VERSION,
+    SummaryOutput,
+)
+from .summary import build_system_prompt as build_summary_system_prompt
+from .summary import build_user_prompt as build_summary_user_prompt
+from .embedding import run_embedding
+from .reranking import run_reranking
 from .schemas import AIResult, ExecuteRequest
 
 
@@ -93,6 +108,248 @@ def run_noop(req: ExecuteRequest) -> AIResult:
 # would have to be rewritten around whichever of the two shapes the provider
 # turns out to need.
 
-FEATURES: dict[str, Callable[[ExecuteRequest], AIResult]] = {
+async def run_classification(req: ExecuteRequest) -> AIResult:
+    """Extract classification SIGNALS from the ticket text.
+
+    What this function deliberately does NOT do: decide priority, decide
+    severity, decide routing, or touch any ticket state. It returns facts and
+    confidences; Core turns those into decisions (see
+    core-service/src/internal/classification.rules.ts). That split is the whole
+    architecture, and the easiest place to erode it is here.
+    """
+    started = time.perf_counter()
+
+    if not req.input.description or not req.input.description.strip():
+        # Permanent: an empty description is empty on every retry too.
+        raise FeatureError("invalid_input", "description must not be empty", "permanent")
+
+    taxonomy = req.input.taxonomy
+    if taxonomy is None:
+        raise FeatureError(
+            "invalid_input", "classification requires a taxonomy", "permanent"
+        )
+
+    categories = [c.value for c in taxonomy.categories]
+    issue_types = list(taxonomy.issue_types or [])
+    impacts = list(taxonomy.impacts or [])
+
+    try:
+        schema_model = build_classification_schema(
+            categories=categories, issue_types=issue_types, impacts=impacts
+        )
+    except ClassificationSchemaError as exc:
+        # The PRODUCT is misconfigured, not the model misbehaving. Permanent:
+        # retrying cannot make a vocabulary appear.
+        raise FeatureError("invalid_input", str(exc), "permanent") from exc
+
+    if not config.classification_enabled:
+        # Honest unavailability rather than a fake answer. Temporary, so the
+        # job survives until a credential is configured — and so an
+        # unconfigured deployment never silently writes a made-up
+        # classification onto a real ticket.
+        raise FeatureError(
+            "provider_not_configured",
+            "no classification provider credential is configured",
+            "temporary",
+        )
+
+    from ..integrations.llm_client import (
+        LLMPermanentError,
+        LLMTemporaryError,
+        OpenRouterClient,
+    )
+
+    client = OpenRouterClient(
+        completions=_completions(),
+        model=config.classification_model,
+        budget_seconds=config.classification_budget_seconds,
+    )
+
+    try:
+        result = await client.generate_structured(
+            system_prompt=build_system_prompt(
+                categories=categories, issue_types=issue_types, impacts=impacts
+            ),
+            user_prompt=build_user_prompt(
+                subject=req.input.subject, description=req.input.description
+            ),
+            response_model=schema_model,
+            request_id=req.request_id,
+        )
+    except LLMTemporaryError as exc:
+        raise FeatureError(exc.code, str(exc), "temporary") from exc
+    except LLMPermanentError as exc:
+        raise FeatureError(exc.code, str(exc), "permanent") from exc
+
+    payload = result.value.model_dump()
+
+    return AIResult(
+        feature="classification",
+        status="succeeded",
+        data=payload,
+        # The weakest-link composite is computed by CORE, from these same
+        # numbers. Reporting one here too would be a second source of truth for
+        # a value Core must own.
+        confidence=None,
+        provider=config.classification_provider,
+        model=config.classification_model_id,
+        model_version=None,
+        prompt_version=PROMPT_VERSION,
+        latency_ms=int((time.perf_counter() - started) * 1000),
+        fallback_used=result.used_repair,
+    )
+
+
+async def run_summary(req: ExecuteRequest) -> AIResult:
+    """Summarise the ticket for a support agent.
+
+    INFORMATIONAL ONLY. It returns one string. It has no taxonomy, no
+    thresholds and no decision to make — everything that could influence
+    priority, severity or routing is absent from the contract by construction.
+
+    Shares the classification provider client, budget and bounded-repair
+    behaviour exactly. Nothing here is summary-specific except the prompt and
+    the one-field schema; a second timeout or retry mechanism for this feature
+    would be a second retry owner.
+    """
+    started = time.perf_counter()
+
+    if not req.input.description or not req.input.description.strip():
+        # Permanent: an empty description is empty on every retry too.
+        raise FeatureError("invalid_input", "description must not be empty", "permanent")
+
+    if not config.classification_enabled:
+        # Honest unavailability rather than a fabricated summary. Temporary, so
+        # the job survives until a credential is configured.
+        raise FeatureError(
+            "provider_not_configured",
+            "no AI provider credential is configured",
+            "temporary",
+        )
+
+    from ..integrations.llm_client import (
+        LLMPermanentError,
+        LLMTemporaryError,
+        OpenRouterClient,
+    )
+
+    client = OpenRouterClient(
+        completions=_completions(),
+        model=config.classification_model,
+        budget_seconds=config.classification_budget_seconds,
+    )
+
+    try:
+        result = await client.generate_structured(
+            system_prompt=build_summary_system_prompt(target_words=SUMMARY_TARGET_WORDS),
+            user_prompt=build_summary_user_prompt(
+                subject=req.input.subject, description=req.input.description
+            ),
+            response_model=SummaryOutput,
+            request_id=req.request_id,
+        )
+    except LLMTemporaryError as exc:
+        raise FeatureError(exc.code, str(exc), "temporary") from exc
+    except LLMPermanentError as exc:
+        raise FeatureError(exc.code, str(exc), "permanent") from exc
+
+    return AIResult(
+        feature="summary",
+        status="succeeded",
+        # Core validates and bounds this before anything is persisted; Python
+        # returning it is not the same as Core accepting it.
+        data=result.value.model_dump(),
+        confidence=None,
+        provider=config.classification_provider,
+        model=config.classification_model_id,
+        model_version=None,
+        prompt_version=SUMMARY_PROMPT_VERSION,
+        latency_ms=int((time.perf_counter() - started) * 1000),
+        fallback_used=result.used_repair,
+    )
+
+
+def _completions():
+    """The provider's chat-completions handle.
+
+    ⚠️ DELIBERATELY httpx, NOT the `openai` SDK.
+
+    Two reasons, one forced and one preferred:
+
+    1. FORCED. openai 1.6.1 passes `proxies=` to httpx, which httpx 0.28
+       removed — `TypeError: AsyncClient.__init__() got an unexpected keyword
+       argument 'proxies'`. This repo pins httpx 0.28.1 and uses it elsewhere,
+       so the SDK would force either a global SDK upgrade or an httpx downgrade
+       for a client that makes exactly one kind of request.
+
+    2. PREFERRED. The SDK retries twice by default. Disabling that
+       (`max_retries=0`) is easy to write and easy to lose in a future upgrade,
+       and losing it silently turns one worker attempt into three provider
+       calls — BullMQ would no longer be the only retry owner and nothing would
+       say so. httpx has no retry to disable.
+
+    The wire format is unchanged: an OpenAI-compatible POST to
+    /chat/completions against OpenRouter's base URL, which is what the design
+    freeze specified.
+    """
+    if _COMPLETIONS_FACTORY is not None:
+        return _COMPLETIONS_FACTORY()
+
+    # CACHED for the process lifetime, so the pooled connections inside it are
+    # actually reused. Rebuilding the transport per call would create a new
+    # connection pool each time and reintroduce the per-request TLS handshake
+    # this exists to avoid — the pool has to outlive the request to be a pool.
+    global _COMPLETIONS  # noqa: PLW0603 — a process-lifetime singleton
+    if _COMPLETIONS is not None:
+        return _COMPLETIONS
+    from ..integrations.llm_client import HttpxChatCompletions
+
+    provider = config.classification_provider
+    if provider == "azure":
+        _COMPLETIONS = HttpxChatCompletions(
+            base_url=config.azure_endpoint,
+            api_key=config.azure_api_key,
+            timeout_seconds=config.classification_budget_seconds,
+            provider="azure",
+            azure_deployment=config.azure_deployment,
+            azure_api_version=config.azure_api_version,
+        )
+    else:
+        _COMPLETIONS = HttpxChatCompletions(
+            base_url=config.openrouter_base_url,
+            api_key=config.openrouter_api_key,
+            timeout_seconds=config.classification_budget_seconds,
+        )
+    return _COMPLETIONS
+
+
+_COMPLETIONS_FACTORY: Callable[[], object] | None = None
+
+# The process-lifetime provider transport. See _completions().
+_COMPLETIONS: object | None = None
+
+
+def set_completions_factory(factory: Callable[[], object] | None) -> None:
+    """Test seam: substitute the provider handle. Never used in production."""
+    global _COMPLETIONS_FACTORY, _COMPLETIONS  # noqa: PLW0603 — module-level test seam
+    _COMPLETIONS_FACTORY = factory
+    _COMPLETIONS = None  # drop any cached real transport
+
+
+# Handlers may be sync (pure CPU, like the stub) or async (anything that makes
+# a network call). app.py awaits whatever is awaitable — see its dispatch.
+#
+# This is the prerequisite the Phase 3 Step 6 note in this file predicted: a
+# blocking provider call added to a SYNC handler would stall the whole event
+# loop, not just its own request.
+FEATURES: dict[str, Callable[[ExecuteRequest], Any]] = {
     "noop": run_noop,
+    "classification": run_classification,
+    "summary": run_summary,
+    # Phase 10. Not a prediction: a measurement of the input, with no prompt,
+    # no schema and nothing to distrust in what comes back beyond its shape.
+    "embedding": run_embedding,
+    # Phase 12. Reorders an already-authorized candidate list. It ranks
+    # ORDINALS, so it cannot name a document Core did not supply.
+    "reranking": run_reranking,
 }

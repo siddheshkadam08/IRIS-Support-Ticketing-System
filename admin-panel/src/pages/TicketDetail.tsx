@@ -64,6 +64,36 @@ export default function TicketDetail() {
   const failedRevoke = ticket.grants.find((g) => g.state === 'revoke_failed');
   const nextStatuses = allowedNext(ticket.status);
 
+  /**
+   * The AI summary, if one has been generated.
+   *
+   * Read defensively and shown only when it is a non-empty string: the field
+   * is written by the AI pipeline and a ticket may predate the capability,
+   * have a summary still in flight, or have had its summary execution fail.
+   * All three are ordinary states that should render as "no summary", never as
+   * a broken panel or a provider error shown to an agent.
+   */
+  const aiSummary: string | null = (() => {
+    const raw = (ticket as { summary?: unknown } | undefined)?.summary;
+    return typeof raw === 'string' && raw.trim().length > 0 ? raw : null;
+  })();
+
+  /**
+   * Composite confidence, if this ticket was classified by AI.
+   *
+   * Read defensively: ai_classification is jsonb written by the AI pipeline
+   * and a row may predate the current shape, so anything unexpected simply
+   * shows no percentage rather than breaking the page.
+   */
+  const aiConfidence: number | null = (() => {
+    const raw = (ticket as { ai_classification?: unknown } | undefined)?.ai_classification;
+    if (!raw || typeof raw !== 'object') return null;
+    const decision = (raw as { decision?: unknown }).decision;
+    if (!decision || typeof decision !== 'object') return null;
+    const value = (decision as { composite_confidence?: unknown }).composite_confidence;
+    return typeof value === 'number' && value >= 0 && value <= 1 ? value : null;
+  })();
+
   return (
     <>
       {/* A dead-lettered revoke means access may outlive the ticket. It is a
@@ -92,6 +122,46 @@ export default function TicketDetail() {
             <div style={{ fontSize: 16, fontWeight: 650, marginBottom: 6 }}>
               {ticket.subject || 'Support request'}
             </div>
+
+            {/*
+              The AI summary sits ABOVE the description and is visibly labelled
+              and visually distinct. Both parts matter: an agent scanning for
+              the gist should hit it first, and nobody should ever be unsure
+              which text the customer actually wrote. It never replaces the
+              description — the customer's own words are always shown in full
+              directly below.
+
+              `undefined` (older ticket, or summary still running) renders
+              nothing rather than an error: an absent enrichment is a normal
+              state, not a fault.
+            */}
+            {aiSummary ? (
+              <div
+                style={{
+                  fontSize: 13,
+                  lineHeight: 1.55,
+                  marginBottom: 12,
+                  padding: '8px 10px',
+                  borderLeft: '3px solid var(--accent, #2563EB)',
+                  background: 'var(--surface-muted, rgba(37,99,235,0.05))',
+                  borderRadius: 4,
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 10,
+                    letterSpacing: 0.4,
+                    textTransform: 'uppercase',
+                    color: 'var(--muted)',
+                    marginBottom: 3,
+                  }}
+                >
+                  AI summary
+                </div>
+                {aiSummary}
+              </div>
+            ) : null}
+
             <div style={{ fontSize: 13, color: 'var(--ink-soft)', lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
               {ticket.description}
             </div>
@@ -151,7 +221,33 @@ export default function TicketDetail() {
               <dt>Raised</dt>
               <dd title={absTime(ticket.raised_at)}>{relTime(ticket.raised_at)}</dd>
               <dt>Category</dt>
-              <dd>{ticket.category ?? '—'}</dd>
+              <dd>
+                {ticket.category ?? '—'}{' '}
+                {/*
+                  Where the classification came from, and how sure the model
+                  was. Shown together on purpose: an agent deciding whether to
+                  trust a category needs both, and "AI said reports" without a
+                  confidence invites more trust than it has earned.
+                */}
+                {ticket.classification_source === 'ai_auto' ? (
+                  <span className="tag" title="Classified by AI with high confidence">
+                    AI
+                  </span>
+                ) : ticket.classification_source === 'ai_uncertain' ? (
+                  <span className="tag" title="Classified by AI, but not confidently — please review">
+                    AI · review
+                  </span>
+                ) : ticket.classification_source === 'product' ? (
+                  <span className="tag" title="Supplied by the product, not by AI">
+                    product
+                  </span>
+                ) : null}
+                {aiConfidence !== null ? (
+                  <span style={{ color: 'var(--muted)', marginLeft: 6 }}>
+                    {Math.round(aiConfidence * 100)}%
+                  </span>
+                ) : null}
+              </dd>
               <dt>Assignee</dt>
               <dd>{ticket.assignee?.display_name ?? <span style={{ color: 'var(--muted)' }}>Unassigned</span>}</dd>
               {ticket.rating ? (<><dt>Rating</dt><dd>{'★'.repeat(ticket.rating)}</dd></>) : null}

@@ -13,7 +13,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-AIFeature = Literal["noop", "classification", "sentiment", "keywords", "summary", "rag"]
+AIFeature = Literal[
+    "noop", "classification", "sentiment", "keywords", "summary", "rag", "embedding",
+    "reranking",
+]
 
 
 class Strict(BaseModel):
@@ -33,14 +36,66 @@ class TaxonomyCategory(Strict):
 
 
 class Taxonomy(Strict):
+    """The allowed values a classifying feature may choose from.
+
+    `issue_types` and `impacts` are Phase 4 additions. They are optional so a
+    `noop` job — and any Core that predates Phase 4 — still validates; the
+    classification feature checks for them itself and fails loudly rather than
+    silently classifying against an empty vocabulary.
+
+    NOTE what is deliberately absent: `core_categories`. That list only feeds
+    Core's deterministic priority engine, so sending it here would widen the
+    data boundary to carry something this service cannot use.
+    """
+
     categories: list[TaxonomyCategory]
     severities: list[str]
+    issue_types: list[str] | None = None
+    impacts: list[str] | None = None
 
 
 class Thresholds(Strict):
-    auto_route_p1: float = Field(ge=0, le=1)
+    """Core's confidence-routing thresholds.
+
+    Transported for completeness and NEVER read by this service — routing is
+    Core's decision and is computed there. Nothing in the classification path
+    references these values.
+
+    `auto_route_p1` is deliberately NOT capped at 1. A value above 1.0 is the
+    documented way to make AUTO_ROUTE unreachable for a product, which is the
+    controlled-rollout control used while the model's self-reported confidence
+    is still uncalibrated. The original `le=1` encoded an assumption that the
+    threshold is always a probability; it is a comparison bound, and "higher
+    than any attainable confidence" is a legitimate setting. Capping it here
+    would have turned that safety control into a 422 — a permanent failure on
+    every ticket — for a field this service does not even use.
+
+    The other two stay bounded: neither has an equivalent out-of-range meaning.
+    """
+
+    auto_route_p1: float = Field(ge=0)
     auto_route_margin: float = Field(ge=0, le=1)
     triage_floor: float = Field(ge=0, le=1)
+
+
+class RerankCandidate(Strict):
+    """One already-authorized candidate, Phase 12.
+
+    ⚠️ NOTE WHAT IS ABSENT AND MUST STAY ABSENT: source_id, product_id,
+    reference, raiser identity, retrieval score. Core numbers its own
+    candidates and sends ORDINALS, so the model ranks 1..N and is
+    structurally incapable of naming a document Core did not supply. There is
+    no field here in which to name one.
+
+    `kind` is the kind of EVIDENCE, not a tenant identifier: a written article
+    answers a question differently from a past ticket, and withholding that
+    would make the ranking harder for no security gain.
+    """
+
+    ordinal: int = Field(ge=1, le=10)
+    kind: Literal["article", "ticket"]
+    title: str
+    excerpt: str
 
 
 class ExecuteInput(Strict):
@@ -49,6 +104,9 @@ class ExecuteInput(Strict):
     # Only features that classify receive these. The stub gets neither.
     taxonomy: Taxonomy | None = None
     thresholds: Thresholds | None = None
+    # Phase 12 reranking only. Bounded here as well as in Core, so an oversized
+    # list is a 422 at the boundary rather than a large provider bill.
+    candidates: list[RerankCandidate] | None = Field(default=None, max_length=10)
 
 
 class ExecuteRequest(Strict):

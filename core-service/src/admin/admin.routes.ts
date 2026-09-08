@@ -23,6 +23,7 @@ import {
   updateUser,
   type SupportRole,
 } from '../users/user.repo.js';
+import { invalidCoreCategories, type ProductConfig } from '../products/product.repo.js';
 import { assertTenant, requireRole, resolveAdminCaller } from './admin.context.js';
 
 const CreateUserBody = z.object({
@@ -159,7 +160,46 @@ const WidgetConfigBody = z.object({
   allow_anonymous: z.boolean().optional(),
   knowledge_base_enabled: z.boolean().optional(),
   deflection_enabled: z.boolean().optional(),
-});
+
+  // ── Phase 4 classification taxonomy ──────────────────────────────────
+  //
+  // All optional: a product that configures none falls back to the platform
+  // defaults and still classifies. Bounded because every value is rendered
+  // into the model prompt AND compiled into a JSON-Schema enum — an unbounded
+  // list is a token-cost and latency problem, not just untidy.
+  issue_types: z.array(z.string().min(1).max(40)).max(20).optional(),
+  impacts: z.array(z.string().min(1).max(40)).max(10).optional(),
+  /**
+   * Categories whose breakage blocks a core workflow. Feeds the deterministic
+   * priority engine (never sent to the AI service).
+   */
+  core_categories: z.array(z.string().min(1).max(40)).max(30).optional(),
+})
+  /**
+   * NOTE: `core_categories ⊆ categories[].value` is deliberately NOT checked
+   * here.
+   *
+   * This endpoint MERGES into the stored config, so a request may legitimately
+   * carry one side of that relationship and not the other. A body-level check
+   * sees only what was sent, and therefore passes silently in exactly the cases
+   * that need it — core_categories set against categories the caller never sent,
+   * or categories narrowed out from under core_categories that already exist.
+   *
+   * The invariant is enforced on the MERGED result inside the transaction
+   * instead (see invalidCoreCategories in products/product.repo.ts), which is
+   * the only place it is a complete statement.
+   *
+   * The two refinements below stay: duplicates are a property of the submitted
+   * list alone, so the body is the right place to judge them.
+   */
+  .refine((cfg) => !cfg.issue_types || new Set(cfg.issue_types).size === cfg.issue_types.length, {
+    message: 'issue_types must not contain duplicates',
+    path: ['issue_types'],
+  })
+  .refine((cfg) => !cfg.impacts || new Set(cfg.impacts).size === cfg.impacts.length, {
+    message: 'impacts must not contain duplicates',
+    path: ['impacts'],
+  });
 
 const TenantBody = z.object({
   slug: z.string().min(2).max(40).regex(/^[a-z0-9-]+$/),
@@ -500,11 +540,35 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
       const next: Record<string, unknown> = { ...current, widget };
       if (body.categories) next.categories = body.categories;
+      if (body.issue_types) next.issue_types = body.issue_types;
+      if (body.impacts) next.impacts = body.impacts;
+      if (body.core_categories) next.core_categories = body.core_categories;
       if (body.knowledge_base_enabled !== undefined) {
         next.knowledge_base = { ...(current.knowledge_base ?? {}), enabled: body.knowledge_base_enabled };
       }
       if (body.deflection_enabled !== undefined) {
         next.deflection = { ...(current.deflection ?? {}), enabled: body.deflection_enabled };
+      }
+
+      /**
+       * THE INVARIANT, checked on the merged result rather than on the request.
+       *
+       * `next` is the exact configuration about to be stored, so this holds
+       * whichever half the caller supplied — including a partial update that
+       * touches only one of the two lists. It runs inside the transaction and
+       * under the `FOR UPDATE` taken above, so a concurrent edit cannot slip
+       * between the check and the write.
+       *
+       * Throwing here rolls the transaction back: a rejected update leaves the
+       * stored configuration exactly as it was.
+       */
+      const offending = invalidCoreCategories(next as ProductConfig);
+      if (offending.length > 0) {
+        throw new AppError(
+          'invalid_request',
+          `core_categories must all appear in categories[].value. ` +
+            `Not found: ${offending.join(', ')}.`,
+        );
       }
 
       await tx.query(`UPDATE product SET config = $2::jsonb WHERE id = $1`, [

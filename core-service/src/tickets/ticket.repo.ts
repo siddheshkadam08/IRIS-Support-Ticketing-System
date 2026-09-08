@@ -282,3 +282,96 @@ export async function setRating(
     [ticketId, rating, comment],
   );
 }
+
+/**
+ * Apply an AI classification to a ticket — Phase 4.
+ *
+ * THE `WHERE` CLAUSE IS THE POLICY.
+ *
+ * `classification_source = 'unclassified'` is the entire human/product
+ * override protection, and it is enforced by Postgres rather than by a prior
+ * read. A read-then-write would race a product classifying the same ticket
+ * through POST /v1/tickets, and the loser would silently overwrite the winner.
+ * Here the database arbitrates, the same way `WHERE status = 'running'`
+ * arbitrates every other conditional write in this pipeline.
+ *
+ * `insertTicket` above sets the source to 'product' whenever the product
+ * supplied a category or severity, with the comment "AI must not override
+ * them". This function is the other half of that decision, written in Phase 1
+ * and honoured here.
+ *
+ * Returns false when nothing matched. That is a NORMAL outcome — the ticket
+ * was already classified — not a failure, and the caller records it as
+ * `ticket_updated: false` rather than failing the execution.
+ *
+ * Only classification columns are touched. subject, description, status,
+ * assignee, comments and attachments are deliberately absent: an AI
+ * classification must not be able to mutate ticket content.
+ */
+export async function applyClassification(
+  tx: Tx,
+  args: {
+    ticketId: string;
+    category: string;
+    severity: string;
+    sentiment: string | null;
+    classificationSource: 'ai_auto' | 'ai_uncertain';
+    aiClassification: Record<string, unknown>;
+  },
+): Promise<boolean> {
+  const { rowCount } = await tx.query(
+    `UPDATE ticket
+        SET category              = $2,
+            severity              = $3,
+            sentiment             = $4,
+            classification_source = $5,
+            ai_classification     = $6::jsonb,
+            updated_at            = now()
+      WHERE id = $1
+        AND classification_source = 'unclassified'`,
+    [
+      args.ticketId,
+      args.category,
+      args.severity,
+      args.sentiment,
+      args.classificationSource,
+      JSON.stringify(args.aiClassification),
+    ],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/**
+ * Store the AI-generated summary — Phase 5.
+ *
+ * NO OVERRIDE GUARD, and that is deliberate rather than an omission.
+ *
+ * `applyClassification` above is guarded by
+ * `classification_source = 'unclassified'` because `category` and `severity`
+ * can be set by the product, so AI must not overwrite someone else's decision.
+ * `ticket.summary` has no such author: the column existed unused since the
+ * first migration and nothing in the platform has ever written it. There is
+ * no human value to protect, so a guard would only prevent the AI from
+ * refreshing its own earlier output.
+ *
+ * That is also precisely why the summary lives here and not in `description`.
+ * It is a DERIVED field; the customer's own words stay untouched.
+ *
+ * The row is matched by id alone, so a replay or a re-dispatch overwrites the
+ * current summary with the newer one — the intended behaviour for a current
+ * derived value. Every prior version remains in `ai_execution.result`, which
+ * is immutable.
+ */
+export async function applySummary(
+  tx: Tx,
+  args: { ticketId: string; summary: string },
+): Promise<boolean> {
+  const { rowCount } = await tx.query(
+    `UPDATE ticket
+        SET summary    = $2,
+            updated_at = now()
+      WHERE id = $1`,
+    [args.ticketId, args.summary],
+  );
+  return (rowCount ?? 0) > 0;
+}

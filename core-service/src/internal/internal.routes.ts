@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { AppError } from '@iris/shared/types';
 import { aiInternalRoutes } from './ai.routes.js';
+import { embeddingInternalRoutes } from './embedding.routes.js';
 import { registerServiceAuth } from './service-auth.js';
 
 /**
@@ -53,4 +54,7 @@ export async function internalRoutes(app: FastifyInstance): Promise<void> {
   registerServiceAuth(app);
 
   await app.register(aiInternalRoutes);
+  // Phase 10. Inside this scope, so it inherits the raw-body parser and
+  // registerServiceAuth — see the SECURITY note above.
+  await app.register(embeddingInternalRoutes);
 }

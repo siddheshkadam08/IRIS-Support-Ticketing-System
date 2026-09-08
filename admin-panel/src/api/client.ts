@@ -121,6 +121,8 @@ export interface TicketRow {
   description: string;
   category: string | null;
   severity: string | null;
+  /** Phase 5: AI-generated, informational. Never the customer's own words. */
+  summary?: string | null;
   raised_at: string;
   raised_by: { ref: string; name: string | null; email: string | null };
   assignee: { id: string; display_name: string } | null;
@@ -179,6 +181,14 @@ export interface TicketDetail extends TicketRow {
     after: unknown;
   }>;
   access: { has_platform_grant: boolean; reason: string | null };
+  /**
+   * Phase 4. Where the classification came from, and the AI's own record of
+   * how it got there. `ai_classification` is deliberately `unknown`: it is
+   * jsonb written by the AI pipeline, so the UI reads it defensively rather
+   * than pretending to know its shape.
+   */
+  classification_source?: 'product' | 'ai_auto' | 'ai_uncertain' | 'unclassified';
+  ai_classification?: unknown;
 }
 
 export interface AdminUser {

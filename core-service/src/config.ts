@@ -92,6 +92,64 @@ const Env = z.object({
     .string()
     .min(16)
     .default('dev_ai_worker_hmac_secret_change_me'),
+
+  /**
+   * Phase 11 — Core's OUTBOUND credential to the Python AI service.
+   *
+   * A THIRD secret, deliberately. Hybrid retrieval needs a query embedding on a
+   * synchronous, user-facing request, and the worker is not on that path — so
+   * Core needs its own edge to Python for the first time.
+   *
+   * It is NOT AI_SERVICE_HMAC_SECRET (the worker's Python-facing credential)
+   * and NOT AI_WORKER_HMAC_SECRET (which Core uses to VERIFY the worker).
+   * Three secrets, each valid in exactly one direction, none a superset of
+   * another. Sharing one would mean leaking either grants the other's access,
+   * which is precisely the escalation Phase 2 exists to prevent.
+   */
+  AI_CORE_HMAC_SECRET: z.string().min(16).default('dev_ai_core_hmac_secret_change_me'),
+
+  /** Where the AI service listens. Same value the worker uses; not a secret. */
+  AI_SERVICE_URL: z.string().url().default('http://localhost:5000'),
+
+  /**
+   * Bound on the query embedding, on a path where a USER IS WAITING.
+   *
+   * Deliberately much tighter than the worker's 10s. Phase 10 measured this
+   * call at p50 347ms / p95 846ms, so 2500ms is roughly 3x the p95 — enough
+   * that a normal slow call still succeeds, short enough that a dead provider
+   * costs the user a fraction of a second before lexical results are returned
+   * instead. Search degrades; it does not hang.
+   */
+  AI_QUERY_TIMEOUT_MS: z.coerce.number().int().min(250).max(10_000).default(2500),
+
+  /**
+   * Phase 12 — reranking, OFF BY DEFAULT.
+   *
+   * ⚠️ THIS DEFAULT IS A MEASUREMENT, NOT CAUTION. Reranking costs a chat
+   * completion, and this deployment answers one at p50 ~1.7s / p95 ~2.1s
+   * however few candidates it is given — the cost is the deployment's baseline,
+   * not the input size, so the usual "send fewer candidates" lever buys
+   * nothing. Phase 11 search is p50 488ms end to end, so turning this on makes
+   * deflection roughly 4x slower.
+   *
+   * That is a real trade a product owner should make deliberately, not one a
+   * default should make for them. Off, nothing changes: `rerank` returns the
+   * Phase 11 ordering without a provider call.
+   */
+  RERANKING_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true' || v === '1'),
+
+  /**
+   * Hard bound on the reranking call, on a path where a user is waiting.
+   *
+   * 4000ms is ~2x the measured p95 (2149ms): generous enough that a normal slow
+   * call still lands, short enough that a dead provider costs the user four
+   * seconds before Phase 11 ordering is returned instead. Past it, search still
+   * answers — it just answers with the ordering it already had.
+   */
+  RERANK_TIMEOUT_MS: z.coerce.number().int().min(500).max(15_000).default(4000),
 });
 
 const parsed = Env.safeParse(process.env);
@@ -101,7 +159,10 @@ if (!parsed.success) {
 }
 
 /** Placeholders that must never reach production. Names are logged, never values. */
-const DEV_PLACEHOLDERS = new Set(['dev_ai_worker_hmac_secret_change_me']);
+const DEV_PLACEHOLDERS = new Set([
+  'dev_ai_worker_hmac_secret_change_me',
+  'dev_ai_core_hmac_secret_change_me',
+]);
 
 /**
  * Fail fast in production on a known-value or weak signing secret. A secret
@@ -110,9 +171,16 @@ const DEV_PLACEHOLDERS = new Set(['dev_ai_worker_hmac_secret_change_me']);
  */
 if (parsed.data.NODE_ENV === 'production') {
   const weak: string[] = [];
-  const s = parsed.data.AI_WORKER_HMAC_SECRET;
-  if (DEV_PLACEHOLDERS.has(s)) weak.push('AI_WORKER_HMAC_SECRET (dev placeholder)');
-  else if (s.length < 32) weak.push('AI_WORKER_HMAC_SECRET (needs >= 32 chars)');
+  // Every signing secret gets the same check. Adding one to the config without
+  // adding it here would leave a placeholder shipping to production silently.
+  const secrets: Array<[string, string]> = [
+    ['AI_WORKER_HMAC_SECRET', parsed.data.AI_WORKER_HMAC_SECRET],
+    ['AI_CORE_HMAC_SECRET', parsed.data.AI_CORE_HMAC_SECRET],
+  ];
+  for (const [name, s] of secrets) {
+    if (DEV_PLACEHOLDERS.has(s)) weak.push(`${name} (dev placeholder)`);
+    else if (s.length < 32) weak.push(`${name} (needs >= 32 chars)`);
+  }
   if (weak.length) {
     console.error('[core-service] refusing to start in production with:', weak.join(', '));
     process.exit(1);

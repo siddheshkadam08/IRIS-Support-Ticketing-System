@@ -10,6 +10,7 @@ surface, deliberately.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import time
@@ -38,8 +39,23 @@ app = FastAPI(title="IRIS AI Service", version="1.0.0")
 
 SERVICE_START = time.time()
 
-#: The only caller permitted to reach /v1/execute.
-SERVICE_ID = "worker"
+#: The complete set of callers permitted to reach /v1/execute, each with its
+#: OWN secret.
+#:
+#: A CLOSED MAP, not a lookup with a fallback — an unknown service id is a 401,
+#: so adding a caller is a deliberate code change. This mirrors `secretFor()` in
+#: core-service/src/internal/service-auth.ts, which solves the same problem on
+#: the other side of the boundary.
+#:
+#: Phase 11 added `core`. Hybrid retrieval needs a query embedding on a
+#: synchronous user-facing request, where the worker is not on the path. Its
+#: secret is distinct from the worker's, so leaking one grants nothing about the
+#: other.
+def _allowed_services() -> dict[str, str]:
+    return {
+        "worker": config.hmac_secret,
+        "core": config.core_hmac_secret,
+    }
 
 
 def _error(status: int, kind: str, code: str, message: str) -> JSONResponse:
@@ -95,8 +111,10 @@ async def execute(
     # signature would fail for reasons that look like broken crypto.
     raw_body = await request.body()
 
-    if x_iris_service_id != SERVICE_ID:
-        # A closed set, not a lookup with a fallback: only `worker` calls here.
+    secret = _allowed_services().get(x_iris_service_id or "")
+    if secret is None:
+        # A closed set, not a lookup with a fallback. An unknown service id is
+        # rejected before the body is read or parsed.
         return _error(401, "permanent", "unauthenticated", "Service authentication failed.")
 
     if not x_iris_timestamp or not x_iris_nonce or not x_iris_signature:
@@ -108,7 +126,10 @@ async def execute(
     signed_path = request.url.path + (f"?{query}" if query else "")
 
     auth = verify_request(
-        config.hmac_secret,
+        # THE CALLER'S OWN secret, resolved from the closed map above. Using a
+        # single shared secret here would silently undo the key separation the
+        # map exists to create.
+        secret,
         request.method,
         signed_path,
         x_iris_timestamp,
@@ -165,7 +186,11 @@ async def execute(
     bound.info("execute.start")
 
     try:
-        result: AIResult = handler(req)
+        # Handlers are sync (pure CPU) or async (network-bound). Awaiting only
+        # what is awaitable keeps the stub a plain function while letting
+        # classification do real I/O without blocking the event loop.
+        outcome = handler(req)
+        result: AIResult = await outcome if inspect.isawaitable(outcome) else outcome
     except FeatureError as exc:
         bound.warning("execute.failed", code=exc.code, kind=exc.kind)
         return _error(422 if exc.kind == "permanent" else 503, exc.kind, exc.code, exc.message)

@@ -8,6 +8,7 @@ import { isPermanent } from './errors.js';
 import { reportTerminalFailure } from './terminal-report.js';
 import { drainWorker } from './shutdown.js';
 import { LOCK_DURATION_MS } from './limits.js';
+import { startEmbeddingRunner, stopEmbeddingRunner } from './embedding-runner.js';
 
 /**
  * The worker process. One queue, one handler, one retry policy.
@@ -128,6 +129,13 @@ logger.info(
   'worker listening',
 );
 
+/**
+ * Phase 10. A timer, not a queue consumer — it holds no BullMQ job and no
+ * lock, so it cannot delay the drain below. `unref()` inside means it never
+ * keeps the process alive on its own.
+ */
+startEmbeddingRunner();
+
 /** Never print a password that happens to live in a connection string. */
 function redacted(url: string): string {
   try {
@@ -163,6 +171,12 @@ const shutdown = async (signal: string) => {
   shuttingDown = true;
 
   logger.info({ signal, drain_ms: config.AI_WORKER_DRAIN_MS }, 'shutting down');
+
+  // Stop claiming NEW embedding work first. A cycle already in flight is safe
+  // to abandon at any point: nothing is marked done until Core persists it, so
+  // an interrupted cycle costs the provider calls already made and leaves
+  // every affected row pending for the next process.
+  stopEmbeddingRunner();
   const { drained, elapsedMs } = await drainWorker(worker, config.AI_WORKER_DRAIN_MS);
 
   logger.info(

@@ -8,7 +8,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "backfill:embeddings": "tsx src/embedding-backfill.ts"
   },
   "dependencies": {
     "@iris/shared": "*",

@@ -22,5 +22,12 @@ export default defineConfig({
     poolOptions: { forks: { singleFork: true } },
     testTimeout: 20000,
     hookTimeout: 30000,
+    /**
+     * Suite-level cleanup (Phase 5 hardening). The integration suites create
+     * real tickets, so they create real outbox events; without this a run
+     * leaves queued jobs and `running` executions behind and the next run
+     * inherits the backlog. See vitest.global-setup.ts.
+     */
+    globalSetup: ['./vitest.global-setup.ts'],
   },
 });

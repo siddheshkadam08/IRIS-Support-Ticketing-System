@@ -31,6 +31,12 @@ sys.path.insert(0, str(REPO_ROOT / "shared" / "hmac-utils" / "py"))
 TEST_SECRET = "test_ai_service_hmac_secret_0123456789"
 
 os.environ["AI_SERVICE_HMAC_SECRET"] = TEST_SECRET
+
+# Phase 11: core-service is a SECOND caller with its OWN secret. Deliberately a
+# different value here, so a test that accidentally signs with the wrong one
+# fails instead of passing by coincidence.
+CORE_TEST_SECRET = "test_ai_core_hmac_secret_9876543210"
+os.environ["AI_CORE_HMAC_SECRET"] = CORE_TEST_SECRET
 os.environ.setdefault("LOG_LEVEL", "warning")
 
 # The service must boot with NO database credential. If the developer's shell

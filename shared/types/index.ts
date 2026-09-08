@@ -7,3 +7,8 @@ export * from './crypto.js';
 export * from './widget-config.js';
 export * from './ai.js';
 export * from './ai-retry.js';
+export * from './classification.js';
+export * from './summary.js';
+export * from './embedding.js';
+export * from './retrieval.js';
+export * from './reranking.js';

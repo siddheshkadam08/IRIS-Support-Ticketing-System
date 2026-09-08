@@ -1,6 +1,9 @@
 import {
   AppError,
   DEFAULT_AI_THRESHOLDS,
+  DEFAULT_CORE_CATEGORIES,
+  DEFAULT_IMPACTS,
+  DEFAULT_ISSUE_TYPES,
   SEVERITIES,
   isSupportedFeature,
   notFound,
@@ -11,12 +14,17 @@ import {
   type AIResultResponse,
   type AITaxonomy,
   type AIThresholds,
+  type ClassificationDecision,
 } from '@iris/shared/types';
 import { withScope, withSystemScope, type ScopeContext } from '../db/with-scope.js';
 import { writeAudit } from '../audit/index.js';
 import { logger } from '../logger.js';
 import type { ProductConfig } from '../products/product.repo.js';
 import { claimExecution, completeExecution } from './ai.repo.js';
+import { validateClassification } from './classification.validator.js';
+import { validateSummary } from './summary.validator.js';
+import { classificationSourceFor } from './classification.rules.js';
+import { applyClassification, applySummary } from '../tickets/ticket.repo.js';
 
 /**
  * The Core half of the AI pipeline. This is where "AI predicts, IRIS decides"
@@ -157,7 +165,24 @@ function taxonomyFor(config: ProductConfig): AITaxonomy {
   return {
     categories: config.categories ?? [],
     severities: config.severities?.map((s) => s.value) ?? [...SEVERITIES],
+    // Phase 4. Platform defaults when the product configures none, so an
+    // unconfigured product still classifies rather than failing every job —
+    // deliberately generic, because classification quality follows taxonomy
+    // quality and a product that cares should supply its own.
+    issue_types: config.issue_types ?? [...DEFAULT_ISSUE_TYPES],
+    impacts: config.impacts ?? [...DEFAULT_IMPACTS],
   };
+}
+
+/**
+ * The categories whose breakage blocks a core workflow.
+ *
+ * CORE-ONLY. It feeds the deterministic priority engine and is deliberately
+ * NOT part of the taxonomy sent to Python — the inference service cannot use
+ * it, so sending it would widen the data boundary for nothing.
+ */
+function coreCategoriesFor(config: ProductConfig): readonly string[] {
+  return config.core_categories ?? DEFAULT_CORE_CATEGORIES;
 }
 
 /** ADR-005 defaults, overridden per product where configured. */
@@ -175,15 +200,39 @@ export interface FeatureValidation {
   message?: string;
   /** The validated, narrowed payload that is safe to persist. */
   value?: Record<string, unknown>;
+  /**
+   * Phase 4: what Core DECIDED from the validated signals. Present only for
+   * features that change ticket state; `noop` never sets it.
+   */
+  decision?: ClassificationDecision;
 }
 
 /**
- * One validator per feature. Phase 7 adds `classification` here — taxonomy
- * membership, threshold bands, then the deterministic IRIS rules — and the
- * surrounding plumbing does not change.
+ * What a validator is allowed to consult besides the payload.
+ *
+ * Passed rather than looked up so validators stay pure and testable — and so
+ * the taxonomy a classification is checked against is provably the same one
+ * Core resolved for this product, not a second read that could disagree.
  */
-const FEATURE_VALIDATORS: Record<AIFeature, (data: Record<string, unknown>) => FeatureValidation> =
-  {
+export interface ValidationContext {
+  taxonomy: AITaxonomy;
+  thresholds: AIThresholds;
+  coreCategories: readonly string[];
+}
+
+/**
+ * One validator per feature.
+ *
+ * Phase 4 filled in `classification`, and the prediction the Phase 1 comment
+ * here made held: taxonomy membership, threshold bands and the deterministic
+ * rules slotted in, and the surrounding plumbing did not change. The only
+ * signature change was adding the context a classifier needs to check output
+ * against the product's own vocabulary.
+ */
+const FEATURE_VALIDATORS: Record<
+  AIFeature,
+  (data: Record<string, unknown>, ctx: ValidationContext) => FeatureValidation
+> = {
     noop: (data) => {
       if (data.ok !== true) {
         return { ok: false, code: 'invalid_ai_output', message: 'noop.data.ok must be true' };
@@ -198,13 +247,69 @@ const FEATURE_VALIDATORS: Record<AIFeature, (data: Record<string, unknown>) => F
       }
       return { ok: true, value: { ok: true, received_chars: chars } };
     },
-    // Declared so the map is exhaustive over AIFeature. Unreachable in Phase 1:
+    /**
+     * Re-checks every enum against CORE's taxonomy — Python having accepted
+     * the payload is not a security property — then runs the deterministic
+     * engine Python is never allowed to run.
+     */
+    classification: (data, ctx) => {
+      const result = validateClassification(data, ctx);
+      if (!result.ok) return { ok: false, code: result.code, message: result.message };
+      return { ok: true, value: { ...result.value }, decision: result.decision };
+    },
+    /**
+     * Phase 5. Informational enrichment: it returns a bounded string and
+     * nothing else, so there is no path from here to any business decision.
+     * Core still validates independently — Python accepting a payload has
+     * never been a security property.
+     */
+    summary: (data) => {
+      const result = validateSummary(data);
+      if (!result.ok) return { ok: false, code: result.code, message: result.message };
+      return { ok: true, value: { ...result.value } };
+    },
+    // Declared so the map stays exhaustive over AIFeature. Unreachable today:
     // verifyClaims rejects anything outside SUPPORTED_AI_FEATURES first.
-    classification: notImplemented('classification'),
     sentiment: notImplemented('sentiment'),
     keywords: notImplemented('keywords'),
-    summary: notImplemented('summary'),
     rag: notImplemented('rag'),
+    /**
+     * ⚠️ NOT "not yet built" — embedding IS built, and must never arrive here.
+     *
+     * It runs on its own path (/internal/embeddings/*) with its own validator,
+     * its own idempotency key and its own persistence. Reaching this branch
+     * means a queue job claimed `feature: "embedding"`, which is either a bug
+     * or an attempt to route a vector through the ticket-decision pipeline.
+     *
+     * `verifyClaims` rejects it before this point because `embedding` is
+     * deliberately absent from SUPPORTED_AI_FEATURES. This entry is the second
+     * lock on the same door, and it exists because the map is exhaustive over
+     * AIFeature: without it, the compiler would have accepted nothing at all
+     * here, and the eventual default would have been silence.
+     */
+    embedding: () => ({
+      ok: false,
+      code: 'unsupported_feature',
+      message: 'embedding does not travel on the AI job queue',
+    }),
+    /**
+     * ⚠️ Like `embedding`: built, but must never arrive here.
+     *
+     * Reranking is a synchronous step inside a search request, with its own
+     * client, its own validation and no persistence at all. Reaching this
+     * branch means a queue job claimed `feature: "reranking"` — a bug, or an
+     * attempt to route a retrieval ordering through the ticket-decision
+     * pipeline.
+     *
+     * `verifyClaims` already rejects it, because `reranking` is deliberately
+     * absent from SUPPORTED_AI_FEATURES. This is the second lock on the same
+     * door, and it exists because the map is exhaustive over AIFeature.
+     */
+    reranking: () => ({
+      ok: false,
+      code: 'unsupported_feature',
+      message: 'reranking does not travel on the AI job queue',
+    }),
   };
 
 function notImplemented(feature: string) {
@@ -330,6 +435,9 @@ export async function submitAIResult(
   // short and contains only writes.
   let status: 'succeeded' | 'failed';
   let validatedResult: Record<string, unknown> | null = null;
+  // Hoisted so the persistence step below can read the DECISION the validator
+  // made. Only classification sets it; `noop` leaves it null and writes nothing.
+  let validation: FeatureValidation | null = null;
   let errorCode: string | null = null;
   let errorMessage: string | null = null;
 
@@ -340,10 +448,32 @@ export async function submitAIResult(
     errorCode = req.result.error?.code ?? 'ai_failed';
     errorMessage = req.result.error?.message ?? null;
   } else {
-    const validation = FEATURE_VALIDATORS[feature](req.result.data);
+    const thresholds = thresholdsFor(event.productConfig);
+    validation = FEATURE_VALIDATORS[feature](req.result.data, {
+      taxonomy: taxonomyFor(event.productConfig),
+      thresholds,
+      coreCategories: coreCategoriesFor(event.productConfig),
+    });
     if (validation.ok) {
       status = 'succeeded';
-      validatedResult = validation.value ?? {};
+      /**
+       * `ai_execution.result` is the IMMUTABLE record of this execution, so it
+       * carries the DECISION alongside the signals — priority, severity,
+       * routing band, the score breakdown, and the thresholds that were in
+       * force at the time.
+       *
+       * Thresholds especially: they are per-product configuration and can be
+       * edited later, so a stored decision without them cannot be re-derived
+       * or defended afterwards. "Why did this auto-route in March?" must be
+       * answerable from the row, not from today's config.
+       */
+      validatedResult = validation.decision
+        ? {
+            ...(validation.value ?? {}),
+            decision: validation.decision,
+            thresholds_applied: thresholds,
+          }
+        : (validation.value ?? {});
     } else {
       // Untrusted output rejected. This is the "never trust raw LLM output"
       // rule doing its job.
@@ -394,15 +524,50 @@ export async function submitAIResult(
     }
 
     /**
-     * PHASE 1: the ticket is not touched.
+     * PHASE 4: the ticket is written, conditionally.
      *
-     * `noop` exists to prove the pipeline, and proving it must not perturb
-     * business state — that is what makes "an AI failure leaves the ticket
-     * unchanged" a testable assertion rather than a hope. Phase 7 adds the
-     * ticket write here, after the deterministic IRIS rules run, and only for
-     * features permitted to apply.
+     * `noop` still touches nothing — that is what keeps "an AI failure leaves
+     * the ticket unchanged" a testable assertion. Classification writes, but
+     * only into a ticket nobody has classified yet.
+     *
+     * THE GUARD IS THE `WHERE` CLAUSE, not a prior read. A check-then-write
+     * would race a product classifying the same ticket; the conditional UPDATE
+     * makes Postgres the arbitrator, exactly as everywhere else in this
+     * pipeline. Zero rows matched is a normal outcome, not an error: the
+     * execution still succeeded, it simply had nothing to apply.
      */
-    const ticketUpdated = false;
+    let ticketUpdated = false;
+
+    /**
+     * PHASE 5: the summary is written to its own derived column.
+     *
+     * `ticket.summary` has never had a human author — nothing in the platform
+     * wrote it before this — so there is no override rule to apply and nothing
+     * of anyone else's to overwrite. It is unconditionally the AI's field,
+     * which is exactly why the summary went there rather than anywhere near
+     * `description`.
+     *
+     * A re-run legitimately replaces it: the summary is the CURRENT derived
+     * value, and every historical one remains in ai_execution.result.
+     */
+    if (status === 'succeeded' && feature === 'summary' && validatedResult) {
+      ticketUpdated = await applySummary(tx, {
+        ticketId: event.ticketId,
+        summary: String(validatedResult.summary),
+      });
+    }
+
+    if (status === 'succeeded' && validation?.decision && validatedResult) {
+      const d = validation.decision;
+      ticketUpdated = await applyClassification(tx, {
+        ticketId: event.ticketId,
+        category: String(validatedResult.category),
+        severity: d.severity,
+        sentiment: typeof validatedResult.sentiment === 'string' ? validatedResult.sentiment : null,
+        classificationSource: classificationSourceFor(d.routing_decision),
+        aiClassification: { ...validatedResult, decision: d, execution_id: row.id },
+      });
+    }
 
     // entity_type 'ticket' with the ticket's own id so the execution appears
     // in GET /v1/tickets/:id/history with no change to that endpoint — it
@@ -426,6 +591,20 @@ export async function submitAIResult(
         fallback_used: row.fallback_used,
         error_code: row.error_code,
         ticket_updated: ticketUpdated,
+        /**
+         * Phase 4: WHY the ticket got the priority it did, in the audit trail
+         * rather than only in ai_execution.result. Numbers and machine values
+         * only — no ticket text, no rationale prose, no model output.
+         */
+        ...(validation?.decision
+          ? {
+              priority: validation.decision.priority,
+              severity: validation.decision.severity,
+              routing_decision: validation.decision.routing_decision,
+              composite_confidence: validation.decision.composite_confidence,
+              score_breakdown: validation.decision.score_breakdown,
+            }
+          : {}),
       },
     });
 

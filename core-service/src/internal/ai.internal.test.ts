@@ -187,15 +187,65 @@ describe('input endpoint — identity is resolved from Core data', () => {
   });
 
   it('falls back to the ADR-005 default thresholds when the product sets none', async () => {
-    // Verified against the live database: ai_thresholds is null on every
-    // seeded product, so the defaults are what actually ships today.
+    /**
+     * Sets up its own state rather than relying on the seeded database.
+     *
+     * The original relied on `ai_thresholds` being null on every product,
+     * which stopped being true the moment Phase 4's controlled rollout set
+     * `auto_route_p1 = 1.01` per product. A test whose subject is "what
+     * happens when a product configures NOTHING" must arrange that condition
+     * itself, not inherit it.
+     */
+    const before = await withSystemScope('test', async (tx) => {
+      const { rows } = await tx.query<{ config: Record<string, unknown> }>(
+        `SELECT config FROM product WHERE id = $1`,
+        [PRODUCT_A],
+      );
+      return rows[0]!.config ?? {};
+    });
+    const stripped = { ...before };
+    delete stripped.ai_thresholds;
+
+    try {
+      await withSystemScope('test', (tx) =>
+        tx.query(`UPDATE product SET config = $2::jsonb WHERE id = $1`, [
+          PRODUCT_A,
+          JSON.stringify(stripped),
+        ]),
+      );
+      const t = await createTicket(PRODUCT_A);
+      const body = (await postInput(t.eventId, claims(t))).json();
+      expect(body.thresholds).toEqual({
+        auto_route_p1: 0.8,
+        auto_route_margin: 0.25,
+        triage_floor: 0.5,
+      });
+    } finally {
+      // Always restore, including the rollout thresholds this suite must not own.
+      await withSystemScope('test', (tx) =>
+        tx.query(`UPDATE product SET config = $2::jsonb WHERE id = $1`, [
+          PRODUCT_A,
+          JSON.stringify(before),
+        ]),
+      );
+    }
+  });
+
+  it('uses the product overrides when it HAS them', async () => {
+    // The other half: the controlled rollout depends on a per-product value
+    // actually reaching the worker, so assert it does.
     const t = await createTicket(PRODUCT_A);
     const body = (await postInput(t.eventId, claims(t))).json();
-    expect(body.thresholds).toEqual({
-      auto_route_p1: 0.8,
-      auto_route_margin: 0.25,
-      triage_floor: 0.5,
+    const configured = await withSystemScope('test', async (tx) => {
+      const { rows } = await tx.query<{ t: Record<string, number> | null }>(
+        `SELECT config->'ai_thresholds' AS t FROM product WHERE id = $1`,
+        [PRODUCT_A],
+      );
+      return rows[0]!.t;
     });
+    if (configured) {
+      expect(body.thresholds).toEqual({ ...configured });
+    }
   });
 
   it('creates a running ai_execution row keyed on the event', async () => {
@@ -263,8 +313,14 @@ describe('input endpoint — rejections', () => {
   });
 
   it('400s a feature that is declared but not built in this phase', async () => {
+    /**
+     * The example has moved twice as capabilities landed — `classification`
+     * (Phase 4), then `summary` (Phase 5). `sentiment` carries the same
+     * meaning today: declared in the shared contract, not implemented. The
+     * assertion itself is unchanged.
+     */
     const t = await createTicket(PRODUCT_A);
-    const res = await postInput(t.eventId, claims(t, { feature: 'classification' }));
+    const res = await postInput(t.eventId, claims(t, { feature: 'sentiment' }));
     expect(res.statusCode).toBe(400);
     expect(res.json().error.code).toBe('invalid_request');
   });

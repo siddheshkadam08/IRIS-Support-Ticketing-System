@@ -21,6 +21,12 @@ import { signedHeaders } from './signing.js';
  */
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
+/**
+ * Exported as `postToCore` (below) so the Phase 10 embedding cycle reuses this
+ * signing, timeout and 4xx/5xx classification EXACTLY rather than growing a
+ * second, subtly different copy of it. The retry distinction living in one
+ * function is the whole reason this file is shaped this way.
+ */
 async function post<T>(
   path: string,
   body: unknown,
@@ -96,6 +102,8 @@ async function post<T>(
     );
   }
 }
+
+export { post as postToCore };
 
 /**
  * Ask Core for authorized AI input.

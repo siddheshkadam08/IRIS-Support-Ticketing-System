@@ -108,7 +108,28 @@ async function main() {
   check('ai-service is live', aiHealth.status === 'ok');
 
   const aiReady = await fetch(`${AI}/health/ready`).then((r) => r.json());
-  check('ai-service is ready and exposes only the stub', aiReady.features?.join() === 'noop');
+  /**
+   * Readiness must report exactly what this service has BUILT — which is not
+   * the same question as what Core is willing to dispatch.
+   *
+   * Phase 1 built the stub alone; Phase 4 added classification, Phase 5 added
+   * summary and Phase 10 added embedding. The feature gate that decides
+   * Phase 12 added reranking. The feature gate that decides
+   * whether classification actually runs lives in shared/types/ai.ts
+   * (SUPPORTED_AI_FEATURES), on the Core side, and is asserted separately
+   * below.
+   *
+   * ⚠️ `embedding` and `reranking` appearing HERE and being absent from
+   * SUPPORTED_AI_FEATURES
+   * is not an inconsistency — it is the design. The AI service implements the
+   * feature; the ai.jobs queue must never carry it, because it has its own
+   * route, validator and idempotency key. See shared/types/embedding.ts.
+   */
+  check(
+    'ai-service is ready and exposes exactly the features it implements',
+    aiReady.features?.slice().sort().join() === 'classification,embedding,noop,reranking,summary',
+    `got: ${aiReady.features?.join() ?? '(none)'}`,
+  );
 
   const redisAof = await client
     .query('SELECT 1')
@@ -184,13 +205,25 @@ async function main() {
   check('AI dispatcher published the event to the queue', published !== null);
 
   // ── 5. worker + python + core result ──────────────────────────────────
-  const execution = await waitFor(async () => {
-    const { rows } = await client.query(
-      `SELECT * FROM ai_execution WHERE event_id = $1 AND feature = 'noop'`,
-      [event.event_id],
-    );
-    return rows[0]?.status && rows[0].status !== 'running' ? rows[0] : null;
-  });
+  /**
+   * A longer budget than the 20s default, deliberately.
+   *
+   * Each ticket now dispatches TWO features, and classification makes a real
+   * Azure call (~4s, p95 5.2s) that competes for the same worker slots. The
+   * stub itself is unchanged and fast; what grew is the queue it shares.
+   * Timing out here would report a pipeline failure that is really just a
+   * budget set before the pipeline had a provider in it.
+   */
+  const execution = await waitFor(
+    async () => {
+      const { rows } = await client.query(
+        `SELECT * FROM ai_execution WHERE event_id = $1 AND feature = 'noop'`,
+        [event.event_id],
+      );
+      return rows[0]?.status && rows[0].status !== 'running' ? rows[0] : null;
+    },
+    { timeoutMs: 60_000 },
+  );
   check('ai_execution reached a terminal state', execution !== null);
 
   if (execution) {
@@ -214,12 +247,20 @@ async function main() {
 
   // ── 6. audit ──────────────────────────────────────────────────────────
   console.log('\nAudit');
+  /**
+   * Scoped to `noop`, which is what this smoke test proves.
+   *
+   * A ticket now fans out to noop AND classification (Phase 4), so an
+   * unfiltered count asserts something this file is not about and breaks
+   * whenever another feature is enabled. The property under test — one audit
+   * row per execution — is unchanged.
+   */
   const audit = await client.query(
     `SELECT action, actor_type, after FROM audit_event
-      WHERE entity_id = $1 AND action LIKE 'ai.%'`,
+      WHERE entity_id = $1 AND action LIKE 'ai.%' AND after->>'feature' = 'noop'`,
     [ticket.id],
   );
-  check('exactly one AI audit row', audit.rowCount === 1, `got ${audit.rowCount}`);
+  check('exactly one AI audit row for noop', audit.rowCount === 1, `got ${audit.rowCount}`);
   check('audit action is the success action', audit.rows[0]?.action === 'ai.execution_succeeded');
   check('audit actor is the system', audit.rows[0]?.actor_type === 'system');
   check(
@@ -289,11 +330,17 @@ async function main() {
   );
   check('still exactly one audit row', Number(auditAfterDup.rows[0].n) === 1);
 
+  /**
+   * Scoped to `noop`: the property is UNIQUE(event_id, feature), so one event
+   * legitimately has one row PER FEATURE. Counting the whole event would
+   * assert that only one feature exists, which is a different — and now
+   * false — claim.
+   */
   const rowCount = await client.query(
-    `SELECT count(*) AS n FROM ai_execution WHERE event_id = $1`,
+    `SELECT count(*) AS n FROM ai_execution WHERE event_id = $1 AND feature = 'noop'`,
     [event.event_id],
   );
-  check('still exactly one ai_execution row', Number(rowCount.rows[0].n) === 1);
+  check('still exactly one ai_execution row for noop', Number(rowCount.rows[0].n) === 1);
 
   // ── 9. tenant isolation ───────────────────────────────────────────────
   console.log('\nTenant isolation');

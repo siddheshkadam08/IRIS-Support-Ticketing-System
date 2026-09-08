@@ -84,11 +84,24 @@ describe('schema and TypeScript cannot drift', () => {
     expect(schema.$defs.ai_feature.enum).toEqual([...AI_FEATURES]);
   });
 
-  it('Phase 1 supports only the noop stub', () => {
-    expect(SUPPORTED_AI_FEATURES).toEqual(['noop']);
+  it('Core accepts exactly the features that are BUILT', () => {
+    /**
+     * The assertion that matters is the GAP between declared and supported:
+     * AI_FEATURES names every capability the queue will ever carry, and
+     * SUPPORTED_AI_FEATURES names the ones Core will actually accept today.
+     * A job naming a declared-but-unbuilt feature must be a permanent error,
+     * not something retried six times.
+     *
+     * Phase 1 supported the stub alone; Phase 4 added classification and
+     * Phase 5 added summary.
+     */
+    expect(SUPPORTED_AI_FEATURES).toEqual(['noop', 'classification', 'summary']);
     expect(isSupportedFeature('noop')).toBe(true);
-    // Declared for later phases, but Core must reject it today.
-    expect(isSupportedFeature('classification')).toBe(false);
+    expect(isSupportedFeature('classification')).toBe(true);
+    expect(isSupportedFeature('summary')).toBe(true);
+    // Declared in the contract, not built — still rejected.
+    expect(isSupportedFeature('sentiment')).toBe(false);
+    expect(isSupportedFeature('rag')).toBe(false);
     expect(isSupportedFeature('telepathy')).toBe(false);
   });
 

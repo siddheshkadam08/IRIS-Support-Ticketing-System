@@ -68,6 +68,30 @@ const Env = z.object({
    * re-run free.
    */
   AI_WORKER_DRAIN_MS: z.coerce.number().int().min(1000).default(8000),
+
+  // ── Phase 10: the embedding sweep ────────────────────────────────────
+  //
+  // OFF BY DEFAULT. It makes real, billed provider calls over the whole
+  // resolved-ticket and published-article corpus the first time it runs, so it
+  // is opt-in per deployment rather than something a fresh checkout starts
+  // doing on its own.
+  EMBEDDING_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true' || v === '1'),
+  /**
+   * How often to sweep for pending items.
+   *
+   * Five minutes, chosen against what the sweep is FOR rather than against
+   * latency: it maintains a retrieval corpus, and a newly resolved ticket
+   * being searchable within five minutes is indistinguishable from instant to
+   * the agent who will look for it. A short interval would poll an empty
+   * result set all day — the steady state, once the backfill is done, is a
+   * cycle that claims nothing.
+   */
+  EMBEDDING_INTERVAL_MS: z.coerce.number().int().min(10_000).default(300_000),
+  /** Items claimed per cycle. Core caps this again at 32 regardless. */
+  EMBEDDING_BATCH_SIZE: z.coerce.number().int().min(1).max(32).default(16),
 });
 
 const parsed = Env.safeParse(process.env);

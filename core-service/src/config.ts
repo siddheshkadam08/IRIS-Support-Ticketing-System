@@ -150,6 +150,32 @@ const Env = z.object({
    * answers — it just answers with the ordering it already had.
    */
   RERANK_TIMEOUT_MS: z.coerce.number().int().min(500).max(15_000).default(4000),
+
+  /**
+   * Phase 13 — grounded answer generation, OFF BY DEFAULT.
+   *
+   * Same reasoning as reranking, and the same honesty about it: this adds a
+   * chat completion that GENERATES PROSE, so it is slower than reranking
+   * (output tokens dominate generation time) on a path where a user is
+   * waiting. Off, nothing changes — no provider call, and `AskResponse` simply
+   * has no `grounded_answer` field, exactly as before Phase 13.
+   *
+   * It is a genuine product trade — a written answer with citations versus a
+   * fast list of links — and a product owner should make it deliberately.
+   */
+  RAG_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true' || v === '1'),
+
+  /**
+   * Hard bound on the generation call.
+   *
+   * Sits ABOVE the reranking bound because generating a paragraph legitimately
+   * takes longer than emitting a list of integers. Past it, the user still
+   * gets retrieval results — the answer is what is lost, not the search.
+   */
+  RAG_TIMEOUT_MS: z.coerce.number().int().min(1000).max(20_000).default(8000),
 });
 
 const parsed = Env.safeParse(process.env);

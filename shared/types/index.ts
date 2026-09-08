@@ -12,3 +12,4 @@ export * from './summary.js';
 export * from './embedding.js';
 export * from './retrieval.js';
 export * from './reranking.js';
+export * from './rag.js';

@@ -347,6 +347,41 @@
                   }
                 }
               }
+            },
+            "evidence": {
+              "description": "Phase 13 RAG only. Evidence Core has ALREADY authorized, numbered 1..N. Carries no source_id, product_id, reference or tenant identifier: the model cites source NUMBERS, so a citation to a document Core did not supply is unrepresentable.",
+              "type": "array",
+              "maxItems": 5,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "source_number",
+                  "source_type",
+                  "title",
+                  "excerpt"
+                ],
+                "properties": {
+                  "source_number": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5
+                  },
+                  "source_type": {
+                    "type": "string",
+                    "enum": [
+                      "kb_article",
+                      "resolved_ticket"
+                    ]
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "excerpt": {
+                    "type": "string"
+                  }
+                }
+              }
             }
           }
         }

@@ -123,6 +123,8 @@ export interface KbArticleDTO {
   views: number;
 }
 
+import type { GroundedAnswer } from './rag.js';
+
 export interface AskAnswer {
   type: 'kb_article' | 'resolved_ticket';
   id: string;
@@ -137,6 +139,17 @@ export interface AskResponse {
   suggested_action: 'answer' | 'create_ticket';
   answers: AskAnswer[];
   prefill: { description: string; category: string | null; severity: Severity | null };
+  /**
+   * Phase 13 — a grounded answer over `answers`, when RAG produced one.
+   *
+   * ADDITIVE AND OPTIONAL. Absent whenever RAG is disabled, skipped, or failed
+   * for any reason, so every existing consumer keeps working unchanged and
+   * retrieval never becomes unavailable because generation did.
+   *
+   * `cited` holds 1-based indexes into `answers` — never database identifiers,
+   * because the evidence set IS the answers array.
+   */
+  grounded_answer?: GroundedAnswer;
 }
 
 export interface Paginated<T> {

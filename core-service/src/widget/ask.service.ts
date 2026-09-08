@@ -2,6 +2,7 @@ import { newId, type AskAnswer, type AskResponse } from '@iris/shared/types';
 import type { Tx } from '../db/with-scope.js';
 import type { ProductConfig } from '../products/product.repo.js';
 import { hybridSearch } from '../retrieval/hybrid.service.js';
+import { generateGroundedAnswer, type RagFn } from '../retrieval/rag.client.js';
 import { logger } from '../logger.js';
 
 /**
@@ -49,6 +50,8 @@ export async function ask(
     config: ProductConfig;
     /** Threads widget -> gateway -> core -> ai-service -> logs. Never the query. */
     requestId: string;
+    /** Test seam for Phase 13. Production passes nothing. */
+    ragFn?: RagFn;
   },
 ): Promise<AskResponse> {
   const minScore = args.config.deflection?.min_score ?? 0.05;
@@ -122,7 +125,67 @@ export async function ask(
   const best = answers.reduce((m, a) => (a.score > m ? a.score : m), 0);
   // A weak answer is worse than no answer — offer the ticket form instead of
   // forcing a deflection the user will not trust.
-  const suggested = best >= minScore && answers.length > 0 ? 'answer' : 'create_ticket';
+  const retrievalSuggests = best >= minScore && answers.length > 0 ? 'answer' : 'create_ticket';
+
+  /**
+   * ── PHASE 13: GROUNDED ANSWER ─────────────────────────────────────────
+   *
+   * Runs on the answers this function is ALREADY returning, so the evidence
+   * set is exactly `answers` and a citation is an index into it. Nothing is
+   * re-retrieved, nothing is re-authorized, and no identifier crosses the
+   * boundary.
+   *
+   * ⚠️ IT CANNOT MAKE DEFLECTION WORSE. `generateGroundedAnswer` never throws
+   * and returns no answer on every failure path, so a provider outage costs
+   * the written answer and nothing else — the cards are still there.
+   */
+  const rag = args.ragFn ?? generateGroundedAnswer;
+  const ragResult = await rag(args.question, hits, args.requestId);
+
+  /**
+   * ⚠️ NEVER ATTACH PROSE WITH NO SOURCES UNDER IT.
+   *
+   * The client already refuses to call the provider without evidence, so this
+   * is defence in depth at the assembly point — but it is the invariant that
+   * actually matters to a reader, and it belongs where the response is built.
+   * An answer the user cannot check any claim against is exactly what
+   * grounding exists to prevent, so if there is nothing to cite there is
+   * nothing to show.
+   */
+  const grounded = answers.length > 0 ? ragResult.grounded : undefined;
+
+  /**
+   * ⚠️ CORE DECIDES, NOT THE MODEL — ADR-009.
+   *
+   * When the model reports it cannot answer from the evidence, that is a
+   * SIGNAL, and Core turns it into the product decision: offer a human. The
+   * model does not get to choose `suggested_action`; it reports that its
+   * citations are empty, and Core reads that.
+   *
+   * The escalation path is never removed by a grounded answer, and it is never
+   * added to by one either — a confident-sounding paragraph must not be able
+   * to talk a user out of reaching support, and `retrievalSuggests` remains
+   * the floor.
+   */
+  const suggested: AskResponse['suggested_action'] =
+    grounded?.insufficient ? 'create_ticket' : retrievalSuggests;
+
+  /**
+   * Bounded, non-sensitive RAG diagnostics. NOT LOGGED: the question, the
+   * answer text, any evidence content, any citation target's title.
+   */
+  logger.info(
+    {
+      request_id: args.requestId,
+      product_id: args.productId,
+      outcome: ragResult.outcome,
+      evidence_count: ragResult.evidenceCount,
+      citation_count: ragResult.citationCount,
+      rag_ms: ragResult.latencyMs,
+      answer_chars: grounded?.answer.length ?? 0,
+    },
+    'deflection grounding',
+  );
 
   const conversationId = await upsertConversation(tx, {
     conversationId: args.conversationId,
@@ -138,6 +201,7 @@ export async function ask(
     conversation_id: conversationId,
     suggested_action: suggested,
     answers,
+    ...(grounded ? { grounded_answer: grounded } : {}),
     prefill: {
       description: args.question,
       category: null,

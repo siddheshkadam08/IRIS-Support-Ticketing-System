@@ -285,3 +285,11 @@ button { font-family: inherit; cursor: pointer; }
 .comment-author { font-size: 12.5px; font-weight: 650; color: var(--ink); }
 .comment-time { font-size: 10.5px; color: var(--muted); }
 .comment-body { font-size: 13px; line-height: 1.5; color: var(--ink-soft); white-space: pre-wrap; }
+
+/* Phase 13 — a cited source is marked so the reader can see what the AI
+   answer rests on. Title and type only; no ids, scores or internals. */
+.answer-card.is-cited { border-color: var(--primary); }
+.answer-cited {
+  margin-left: 6px; padding: 1px 6px; border-radius: 10px;
+  background: var(--primary-soft); color: var(--primary); font-weight: 600;
+}

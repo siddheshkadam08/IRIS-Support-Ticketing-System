@@ -114,7 +114,7 @@ async function main() {
    *
    * Phase 1 built the stub alone; Phase 4 added classification, Phase 5 added
    * summary and Phase 10 added embedding. The feature gate that decides
-   * Phase 12 added reranking. The feature gate that decides
+   * Phase 12 added reranking and Phase 13 added rag. The feature gate that decides
    * whether classification actually runs lives in shared/types/ai.ts
    * (SUPPORTED_AI_FEATURES), on the Core side, and is asserted separately
    * below.
@@ -127,7 +127,7 @@ async function main() {
    */
   check(
     'ai-service is ready and exposes exactly the features it implements',
-    aiReady.features?.slice().sort().join() === 'classification,embedding,noop,reranking,summary',
+    aiReady.features?.slice().sort().join() === 'classification,embedding,noop,rag,reranking,summary',
     `got: ${aiReady.features?.join() ?? '(none)'}`,
   );
 

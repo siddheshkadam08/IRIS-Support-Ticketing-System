@@ -81,7 +81,8 @@ def test_the_features_this_service_implements_are_declared_in_the_contract(schem
     declared = set(schema["$defs"]["ai_feature"]["enum"])
     assert set(FEATURES).issubset(declared)
     # Phase 1 implemented the stub alone; Phase 4 added classification, Phase 5
-    # added summary, Phase 10 added embedding and Phase 12 added reranking. The
+    # added summary, Phase 10 added embedding, Phase 12 added reranking and
+    # Phase 13 added rag. The
     # assertion that matters is
     # unchanged and above: everything this service implements must be DECLARED
     # in the shared contract.
@@ -95,6 +96,7 @@ def test_the_features_this_service_implements_are_declared_in_the_contract(schem
         "summary",
         "embedding",
         "reranking",
+        "rag",
     }
 
 

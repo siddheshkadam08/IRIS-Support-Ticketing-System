@@ -28,7 +28,13 @@ export const AI_FEATURES = [
   'sentiment', // Phase 9
   'keywords', // Phase 9
   'summary', // Phase 5 — informational enrichment, no business authority
-  'rag', // Phase 13
+  /**
+   * Phase 13. Declared since Phase 1; implemented now. Like `embedding` and
+   * `reranking` it is deliberately ABSENT from SUPPORTED_AI_FEATURES below:
+   * grounding is a synchronous step inside a search request and never travels
+   * on the ai.jobs queue.
+   */
+  'rag',
   /**
    * Phase 10. Present here because the worker's structural AIResult check and
    * the /v1/execute contract are shared by every capability — but deliberately

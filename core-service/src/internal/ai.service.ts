@@ -272,7 +272,22 @@ const FEATURE_VALIDATORS: Record<
     // verifyClaims rejects anything outside SUPPORTED_AI_FEATURES first.
     sentiment: notImplemented('sentiment'),
     keywords: notImplemented('keywords'),
-    rag: notImplemented('rag'),
+    /**
+     * ⚠️ Phase 13 BUILT it, and it still must never arrive here.
+     *
+     * RAG is a synchronous step inside a search request: its own client, its
+     * own validation, no execution row, no persistence. Reaching this branch
+     * means a queue job claimed `feature: "rag"` — a bug, or an attempt to
+     * route a generated answer through the ticket-decision pipeline.
+     *
+     * `verifyClaims` already rejects it, because `rag` is deliberately absent
+     * from SUPPORTED_AI_FEATURES. This is the second lock on the same door.
+     */
+    rag: () => ({
+      ok: false,
+      code: 'unsupported_feature',
+      message: 'rag does not travel on the AI job queue',
+    }),
     /**
      * ⚠️ NOT "not yet built" — embedding IS built, and must never arrive here.
      *

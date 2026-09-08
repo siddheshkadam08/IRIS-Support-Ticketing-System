@@ -203,14 +203,17 @@ function composer(placeholder: string): string {
     </div>`;
 }
 
-function answerCard(a: AskAnswer): string {
+function answerCard(a: AskAnswer, cited = false): string {
   const kind = a.type === 'kb_article' ? 'Help article' : 'Previously resolved';
   const attr = a.type === 'kb_article' ? `data-article="${esc(a.id)}"` : `data-answer-ticket="1"`;
+  // A cited source is marked so the reader can see which cards the answer
+  // actually rests on. Title and type only — no ids, no scores, no internals.
+  const mark = cited ? '<span class="answer-cited">Cited</span>' : '';
   return `
-    <button class="answer-card" ${attr}>
+    <button class="answer-card${cited ? ' is-cited' : ''}" ${attr}>
       <div class="answer-title">${esc(a.title)}</div>
       <div class="answer-excerpt">${esc(a.excerpt)}</div>
-      <div class="answer-meta">${kind}</div>
+      <div class="answer-meta">${kind}${mark}</div>
     </button>`;
 }
 
@@ -223,7 +226,17 @@ function askView(): string {
                   <div class="bubble">${esc(t.text)}</div>
                 </div>`;
       }
-      const cards = (t.answers ?? []).map(answerCard).join('');
+      const cards = (t.answers ?? [])
+        .map((a, i) => answerCard(a, t.cited?.includes(i + 1) ?? false))
+        .join('');
+      /**
+       * An AI-written answer is LABELLED as one. The sources are listed
+       * underneath either way, so a reader can check any claim against them —
+       * which is the whole point of grounding.
+       */
+      const groundedNote = t.grounded
+        ? '<div class="answer-meta" style="margin:6px 0 2px">AI answer, based on the sources below</div>'
+        : '';
       const escalate = t.escalate
         ? `<div class="escalate">
              <div class="escalate-text">Not what you were looking for? Create a ticket and a support engineer will pick it up.</div>
@@ -234,7 +247,7 @@ function askView(): string {
                 <div class="msg-avatar">${I.robot(15, 'currentColor')}</div>
                 <div style="flex:1;min-width:0">
                   <div class="bubble">${esc(t.text)}</div>
-                  ${cards}${escalate}
+                  ${groundedNote}${cards}${escalate}
                 </div>
               </div>`;
     })
@@ -564,12 +577,24 @@ async function doAsk(question: string): Promise<void> {
     const res = await api.ask(question, state.conversationId);
     state.conversationId = res.conversation_id;
     const found = res.answers.length > 0;
+    /**
+     * Phase 13. When Core returned a grounded answer, IT becomes the bubble
+     * and the cards below are its sources — which is what the cards already
+     * were. When it did not (RAG off, skipped, or failed), the canned line is
+     * used exactly as before, so this is additive in behaviour as well as in
+     * type.
+     */
+    const g = res.grounded_answer;
     state.chat.push({
       role: 'assistant',
-      text: found
-        ? "Here's what I found that should help:"
-        : "I couldn't find anything matching that. A support engineer can help.",
+      text: g
+        ? g.answer
+        : found
+          ? "Here's what I found that should help:"
+          : "I couldn't find anything matching that. A support engineer can help.",
       answers: res.answers,
+      cited: g?.cited,
+      grounded: Boolean(g) && !g?.insufficient,
       escalate: res.suggested_action === 'create_ticket' || !found,
     });
   } catch (err) {

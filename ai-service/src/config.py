@@ -152,6 +152,14 @@ class Config:
             env.get("RERANKING_BUDGET_SECONDS", "4")
         )
 
+        # Phase 13: grounded answer generation. Also synchronous, but it
+        # GENERATES PROSE rather than a list of integers, so it is inherently
+        # slower than reranking — output tokens dominate generation time.
+        # Measured before it was chosen; see the Phase 13 notes. 6s leaves
+        # headroom over the observed p95 while keeping the worst case short
+        # enough that falling back to plain retrieval is still a fast answer.
+        self.rag_budget_seconds: float = float(env.get("RAG_BUDGET_SECONDS", "6"))
+
         # ── Phase 10: embeddings ─────────────────────────────────────────
         #
         # A SEPARATE deployment from the chat one, and therefore separate

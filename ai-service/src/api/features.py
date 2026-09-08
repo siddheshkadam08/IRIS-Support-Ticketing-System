@@ -29,6 +29,7 @@ from .summary import (
 from .summary import build_system_prompt as build_summary_system_prompt
 from .summary import build_user_prompt as build_summary_user_prompt
 from .embedding import run_embedding
+from .rag import run_rag
 from .reranking import run_reranking
 from .schemas import AIResult, ExecuteRequest
 
@@ -352,4 +353,8 @@ FEATURES: dict[str, Callable[[ExecuteRequest], Any]] = {
     # Phase 12. Reorders an already-authorized candidate list. It ranks
     # ORDINALS, so it cannot name a document Core did not supply.
     "reranking": run_reranking,
+    # Phase 13. Writes a grounded answer over an already-authorized evidence
+    # set and cites source NUMBERS, so it cannot name a document Core did not
+    # supply.
+    "rag": run_rag,
 }

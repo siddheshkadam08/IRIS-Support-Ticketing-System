@@ -98,6 +98,25 @@ class RerankCandidate(Strict):
     excerpt: str
 
 
+class RagEvidence(Strict):
+    """One already-authorized source, Phase 13.
+
+    ⚠️ NOTE WHAT IS ABSENT AND MUST STAY ABSENT: source_id, product_id,
+    product_tenant_id, reference, raiser identity, retrieval score, URL. Core
+    numbers its own evidence and sends ORDINALS, so the model cites 1..N and a
+    citation to anything else is unrepresentable rather than merely invalid.
+
+    `source_type` is the kind of EVIDENCE, not a tenant identifier: a curated
+    article grounds a claim differently from a past ticket, and withholding
+    that would weaken the answer for no security gain.
+    """
+
+    source_number: int = Field(ge=1, le=5)
+    source_type: Literal["kb_article", "resolved_ticket"]
+    title: str
+    excerpt: str
+
+
 class ExecuteInput(Strict):
     subject: str | None
     description: str
@@ -107,6 +126,10 @@ class ExecuteInput(Strict):
     # Phase 12 reranking only. Bounded here as well as in Core, so an oversized
     # list is a 422 at the boundary rather than a large provider bill.
     candidates: list[RerankCandidate] | None = Field(default=None, max_length=10)
+    # Phase 13 RAG only. Same bounding rationale, and the same identifier-free
+    # shape: the model cites source NUMBERS, so it cannot name a document Core
+    # did not supply.
+    evidence: list[RagEvidence] | None = Field(default=None, max_length=5)
 
 
 class ExecuteRequest(Strict):

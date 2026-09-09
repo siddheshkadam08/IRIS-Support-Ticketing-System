@@ -113,7 +113,14 @@ export async function rerank(
           ? 'not_configured'
           : outcome.reason === 'invalid'
             ? 'malformed'
-            : 'provider_unavailable';
+            : // ⚠️ A REFUSAL IS NOT AN OUTAGE. The provider read this exact
+              // prompt and declined it, and will decline it again — so it is
+              // reported as its own terminal outcome rather than as a
+              // transient failure an operator would chase or a caller would
+              // retry. The ACTION is unchanged, and nothing here retries.
+              outcome.reason === 'content_filter'
+              ? 'provider_refused'
+              : 'provider_unavailable';
     logger.warn(
       {
         request_id: requestId,

@@ -82,6 +82,14 @@ export type RerankOutcome =
   | 'skipped_too_few'
   | 'provider_timeout'
   | 'provider_unavailable'
+  /**
+   * ⚠️ The provider read this exact prompt and REFUSED it — Azure's content
+   * management policy, arriving as HTTP 400 upstream. Distinct from
+   * `provider_unavailable` because nothing is down and a retry can only fail
+   * again: an operator chasing an outage here would find none, and a caller
+   * treating it as transient would be wrong. Nothing retries either one.
+   */
+  | 'provider_refused'
   | 'malformed'
   | 'not_configured';
 

@@ -6249,6 +6249,240 @@ Phase 13 · **30/30** Phase 14 · **58/58** Phase 15 · 12/12 evaluation cases.
 
 ---
 
+# 44I. Pre-Phase-16 Hardening
+
+A repository + live-system gap audit before Phase 16 returned **NOT READY**.
+This section records what was fixed, what was measured, and what was not fixed.
+
+## 44I.1 ⚠️ A-1 — the auto-routing kill switch is now durable
+
+`auto_route_p1 = 1.01` makes `auto_route` unreachable (`category_confidence` is
+bounded at 1.0), so every classification lands as `ai_uncertain` for human
+review. It had been applied **by hand to the live database only**, while
+`seed.ts` replaces `product.config` wholesale on conflict and did not carry it —
+so one `npm run seed` restored the 0.8 default and re-enabled unattended routing
+on a confidence signal Phase 4 measured as uncalibrated.
+
+`[LIVE]` Not theoretical: **9 tickets carry `ai_auto` with a real
+`ai_classification` payload**, from before the switch was applied. (A further
+160 `ai_auto` rows are seeded demo data — the seed hard-codes that value — and
+are not evidence of routing.)
+
+Fixed in `seed.ts`: `AI_THRESHOLDS` is part of `tenantConfig()`.
+`core-service/src/products/seed-safety.integration.test.ts` asserts it against
+the **deployed database**, not the seed constants — a unit test would prove the
+seed intends the right thing, not that the running system has it.
+
+`[LIVE]` Verified by capture → `npm run seed` → re-read: `auto_route_p1` is
+`1.01` on all four products, before and after, and `determineRouting(1.0, 1.0, …)`
+returns `soft_route_ai_uncertain` at the most confident input that can exist.
+The counterfactual is asserted too: the same call under `DEFAULT_AI_THRESHOLDS`
+returns `auto_route`.
+
+⚠️ **DO NOT LOWER IT** to make auto-routing "work". Lower it when accept/reject
+data from the `ai_uncertain` queue shows the confidence signal separates correct
+from incorrect classifications.
+
+## 44I.2 ⚠️ A-2 — company-action commitments
+
+`[LIVE]` Baseline, temperature 0, n=6: a refund-demand ticket produced *"I will
+escalate this to the appropriate team for review"* in **6/6** drafts. An
+account-deletion request produced *"…we will provide confirmation…"* in **6/6**.
+
+### The four prompt iterations that did not work
+
+| iteration | change | refund | deletion |
+|---|---|---|---|
+| `copilot-v1` | general prohibition | 6/6 | 6/6 |
+| v2 (a) | enumerated the prohibited commitments | 6/6 | 6/6 |
+| v2 (b) | + worked WRONG/RIGHT example | 5/6 | 6/6 |
+| v2 (c) | + explicit closing-sentence rule | 5/6 | 6/6 |
+| v2 (d) | + rule moved to the primacy position | 5/6 | 6/6 |
+
+⚠️ **Adding prohibitions was the wrong lever, and four measurements said so.**
+
+### Root cause
+
+The prompt asked for **"a reply"** and then forbade thirteen kinds of promise.
+A customer-service *reply*, in the sense the model has learned, ENDS WITH WHAT
+THE COMPANY WILL DO. Every prohibition was arguing with the deliverable the same
+prompt had just requested, and the model resolved that conflict in favour of the
+deliverable — declining the substantive demand correctly, then reaching for a
+closing courtesy that came out as a promise.
+
+Two aggravating factors: the worked example quoted the exact failing sentence
+back at the model, and the JSON schema's own field description still said *"A
+reply to the customer"* — and the schema, being closest to the output, wins.
+
+### The fix — `copilot-v3` changes the deliverable
+
+Copilot no longer drafts "a reply". It drafts the **informational half** of one:
+
+```
+half 1  what is known, what the customer can do, what we still need   <- Copilot
+half 2  what we are going to do about it                              <- the agent
+```
+
+Omitting a company action now COMPLETES the task instead of leaving the reply
+unfinished, so there is no helpfulness pressure left to resolve. `ALLOWED
+CONTENT` became a closed list of four content types rather than an open task
+with exceptions carved out of it, and the schema field description was corrected
+to match. The prompt is also SHORTER than v2 (5,223 vs 6,141 characters) and
+sectioned — ROLE, TASK, AUTHORIZED EVIDENCE, ALLOWED CONTENT, PROHIBITED
+CONTENT, CONTRADICTION HANDLING, CUSTOMER-NEXT-STEP RULE, SELF-REVIEW, OUTPUT
+FORMAT — with a test asserting the sections stay in that order, so the task
+definition cannot drift back behind the prohibitions.
+
+`[LIVE]` Measured, temperature 0, every draft recorded and classified:
+
+```
+refund demand              0/6 unauthorized commitments   (was 6/6)
+account deletion           0/6                            (was 6/6)
+escalation demand          0/6                            (was 0/6)
+positive control           grounded, cited, actionable, no refusal creep
+```
+
+⚠️ **No runtime guard was added.** There is no keyword filter, no regex block,
+no post-generation validator and no second model in this path. The change is
+entirely in what the model is asked to produce.
+
+### What still contains the residual risk
+
+Human review, unchanged and re-verified: a draft is text in a box until an
+authorised person presses Send. `copilot-v3` reduces how often that reviewer has
+to catch a promise; it does not replace them, and a prompt-level property is a
+tendency rather than a guarantee.
+
+`scripts/copilot-safety-eval.mjs` is the standing measurement. Its detector
+matches a semantic shape — a company-side subject bound to a commitment verb —
+and **proves itself first** against nine hand-written commitments and nine
+hand-written refusals, aborting the run rather than grading anything if it
+cannot separate them. It is an evaluation metric and must never become a runtime
+filter: it would reject *"I am unable to confirm either resolution or refund"*
+for containing the wrong words, which is the failure mode that ruled keyword
+filtering out in the first place.
+
+## 44I.3 B-1 — `core_categories` is configured
+
+`[LIVE]` It was `null` on every product, so `determinePriority`'s
+`core_category_system_down_bonus` (+15) had **never fired** and every
+system-down ticket in a core workflow scored one tier low, silently — exactly
+the failure `product.repo.ts` warns about.
+
+Seeded as `['login_access', 'reports', 'data_mismatch']`. `billing` is
+deliberately excluded: a billing page being down is urgent but does not stop the
+customer working. The invariant `core_categories ⊆ categories` is unchanged and
+still enforced on the **merged** config inside the write transaction.
+
+`[LIVE]` The test runs the real `determinePriority` twice on one ticket, with
+and without the product's core list, and requires the scores to differ by
+exactly the bonus — a paired control, so a still-dead branch fails.
+
+## 44I.4 B-2 — the provenance rule, written down
+
+**The rule: `ai_execution` records QUEUE executions only.**
+
+`ai_execution` is keyed `UNIQUE(event_id, feature)`, where `event_id` is an
+outbox event. That key IS the idempotency guarantee for retried work. The
+synchronous features — reranking, RAG, Similar Tickets, Copilot — have no outbox
+event, so a row there would need a synthetic key, which would weaken the one
+property the table exists to provide.
+
+They are also different in kind: a queue execution CHANGES A TICKET and must be
+replayable and attributable. A synchronous call answers one request and mutates
+nothing.
+
+| feature | durable record | provenance |
+|---|---|---|
+| classification, summary, noop | `ai_execution` + audit event | provider, model, prompt version, attempt, latency, error |
+| **Copilot** | `ai.copilot_drafted` audit event | outcome, evidence counts, citation count, draft length, model, prompt version — **metadata only, never the draft** |
+| **RAG** | structured log | outcome, evidence/citation counts, latency, `model`, `prompt_version` |
+| **Similar Tickets** | structured log | corpus/returned counts, latency, outcome. **No model is involved** |
+| **Reranking** | structured log | outcome, candidate count, latency |
+
+Copilot is audited although nothing changed, because ticket text went to a third
+party and content was generated that a human may put in front of a customer.
+Similar Tickets writes no audit event deliberately: nothing auditable happened,
+and manufacturing one would put noise in an append-only compliance log.
+
+Added in this pass: `model` and `prompt_version` on the RAG log line, so every
+AI-authored string in the platform is attributable to a prompt version.
+
+## 44I.5 B-3 — Copilot handles conflicting evidence
+
+Copilot inherited Phase 13's evidence model but not its contradiction rule.
+`[LIVE]` With a KB article and a past resolution planted to disagree, the draft
+presented one cause as settled fact.
+
+`copilot-v3` adds the RAG-equivalent rule. `[LIVE]`, with a gate proving the
+conflicting fixture was actually retrieved — the fixture is planted in the KB
+channel, because the first version planted it as a past resolution at an exact
+distance TIE with a seeded ticket, which landed only sometimes. The gate
+reported INCONCLUSIVE on the run where it lost the tie rather than scoring a
+draft the model never saw the conflict in:
+
+> *"There are a couple of known reasons why report exports can fail. If your
+> export is larger than 50 MB, it may time out and return an error… Another
+> possible cause is an expired…"*
+
+Both sources cited (`[1,2]`), neither asserted as settled fact.
+
+⚠️ **Verified for two conflicting ARTICLES.** Where a past ticket disagrees with
+an article, `[LIVE]` v3 leads with the article and asks for the distinguishing
+detail without naming the ticket's different cause. That is consistent with the
+rule one section above — a past ticket is one thing that happened once — but it
+is not the same property, and it is not claimed as one.
+
+## 44I.6 B-4 — a provider refusal is no longer reported as an outage
+
+`callAiService` collapsed every non-200 to `unavailable`, so Azure's content
+management policy — which reads the prompt and **refuses** it, permanently —
+surfaced as a transient provider outage. An operator paged by that finds nothing
+down; an agent told "unavailable" retries something that can only fail again.
+
+`provider_content_filter` now maps to a distinct `provider_refused` outcome
+across Copilot, RAG and reranking. The AI service's error code is carried as
+`providerCode` for diagnosis, and nothing branches on it.
+
+⚠️ **No retry owner was added.** Nothing on the synchronous path retried before
+this change or after it; `content_filter` and `unavailable` are handled
+identically and differ only in what the outcome is called. BullMQ remains the
+only retry owner. The error body is parsed defensively — a missing, truncated or
+malformed body yields `unavailable`, so the failure path cannot itself fail.
+
+`[LIVE]` A prompt-leak payload returns `outcome=provider_refused` in ~3.1s of
+generation (one attempt); the control returns `drafted`.
+
+## 44I.7 C-1 — the cross-raiser isolation test was vacuous
+
+`(body.answers ?? []).every(a => a.type !== 'resolved_ticket')` passed on an
+**empty** answer list. `[LIVE]` A stranger asking the bare reference gets
+`answers: []` — nothing matches "CARB-1011" lexically once the exact lookup is
+denied — so the assertion passed identically whether isolation worked or
+retrieval was broken end to end.
+
+Both probes now carry two positive controls:
+
+```
+owner(bare):     1 answer  [resolved_ticket]   <- the same query DOES surface it
+stranger(bare):  0 answers                     <- and not for anyone else
+stranger(mixed): 2 answers [kb_article]        <- retrieval demonstrably ran
+```
+
+⚠️ The mixed query deliberately does **not** expect the ticket for the owner
+either: the exact-reference pin fires only when the whole query IS a reference.
+An earlier version of this fix asserted otherwise and failed — the system was
+right and the assertion was wrong.
+
+## 44I.8 Not changed, deliberately
+
+Auto-routing disabled · reranking disabled · Copilot drafts ephemeral · AI
+dispatch fails closed · internal notes excluded from Copilot · two embedding
+calls per draft · no fabricated history or evaluation data · analytics deferred ·
+`OpenRouterClient` naming (docs already record the supersession).
+
+---
+
 # 45. Future Implementation Checklist
 
 
@@ -6304,19 +6538,19 @@ Phase 13 · **30/30** Phase 14 · **58/58** Phase 15 · 12/12 evaluation cases.
 - [ ] vector population
 - [ ] ANN index
 - [ ] similarity search
-- [ ] hybrid retrieval
-- [ ] reranker
+- [x] hybrid retrieval - Phase 11 (44D)
+- [x] reranker - Phase 12 (44E); implemented and DISABLED on measured evidence
 - [ ] corpus indexing
 
 ## RAG/Copilot
 
-- [ ] grounded answer
-- [ ] citations
+- [x] grounded answer - Phase 13 (44F)
+- [x] citations - Phase 13 (44F), ordinals validated fail-closed
 - [ ] Ask a Question
 - [ ] AI Suggestions
-- [ ] draft reply
-- [ ] similar tickets
-- [ ] copilot
+- [x] draft reply - Phase 15 (44H)
+- [x] similar tickets - Phase 14 (44G)
+- [x] copilot - Phase 15 (44H)
 - [ ] assignee recommendation
 
 ## Governance

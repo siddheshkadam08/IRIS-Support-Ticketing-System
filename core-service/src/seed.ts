@@ -82,8 +82,53 @@ const TENANTS: TenantSpec[] = [
   },
 ];
 
+/**
+ * The categories where a total outage is a business emergency rather than an
+ * inconvenience — Phase 4's `core_category_system_down_bonus` (+15).
+ *
+ * ⚠️ MUST BE A SUBSET OF `CATEGORIES[].value`. `invalidCoreCategories` in
+ * products/product.repo.ts enforces that against the MERGED config inside the
+ * write transaction; this list is only the seeded starting point, and a typo
+ * here fails that check loudly rather than silently disabling the bonus.
+ *
+ * `billing` is deliberately absent: a billing page being down is urgent, but it
+ * does not stop the customer doing their job the way login or reporting does.
+ * `other` is absent because a catch-all cannot be a core workflow.
+ */
+const CORE_CATEGORIES = ['login_access', 'reports', 'data_mismatch'];
+
+/**
+ * ⚠️ THE AUTO-ROUTING KILL SWITCH, AND WHY IT LIVES IN THE SEED.
+ *
+ * `auto_route_p1 = 1.01` is unreachable: the model's `category_confidence` is
+ * bounded at 1.0, so `determineRouting` can never return `auto_route` and every
+ * classification lands as `ai_uncertain` for human review. The whole pipeline
+ * still runs — this disables the DECISION, not the capability.
+ *
+ * It is here because it was previously applied by hand to the live database
+ * only, and this seed replaces `product.config` wholesale on conflict. A single
+ * `npm run seed` therefore silently restored the 0.8 default and re-enabled
+ * unattended routing on a confidence signal Phase 4 measured as uncalibrated
+ * (self-reported >=0.95 on nearly every ticket, which put 21 of 23 into
+ * AUTO_ROUTE). A safety control that a routine rebuild removes is not a
+ * control. `products/seed-safety.integration.test.ts` asserts it stays above
+ * 1.0 against the DEPLOYED database — a unit test over this constant would only
+ * prove the seed intends the right thing, not that the running system has it.
+ *
+ * ⚠️ DO NOT LOWER THIS to make auto-routing "work". Lower it only when accept/
+ * reject data from the ai_uncertain queue shows the confidence signal actually
+ * separates correct classifications from incorrect ones.
+ */
+const AI_THRESHOLDS = {
+  auto_route_p1: 1.01,
+  auto_route_margin: 0.25,
+  triage_floor: 0.5,
+};
+
 const tenantConfig = (t: TenantSpec) => ({
   categories: CATEGORIES,
+  core_categories: CORE_CATEGORIES,
+  ai_thresholds: AI_THRESHOLDS,
   default_severity: 'medium',
   widget: {
     title: `${t.name} Support`,

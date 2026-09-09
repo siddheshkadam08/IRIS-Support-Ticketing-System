@@ -66,7 +66,22 @@ export interface CopilotData {
   citations: number[];
 }
 
-export const COPILOT_PROMPT_VERSION = 'copilot-v1';
+/**
+ * Must match `COPILOT_PROMPT_VERSION` in ai-service/src/api/copilot.py.
+ *
+ * v2 (pre-Phase-16 hardening): the ban on describing company actions became an
+ * explicit enumeration, after the general form was measured failing 6/6 on a
+ * refund demand ("I will escalate this to the appropriate team"); and an
+ * explicit conflicting-evidence rule was added to match Phase 13 RAG.
+ *
+ * v3: v2 still failed (5/6 refund demand, 6/6 account deletion). The
+ * prohibitions were arguing with the deliverable the same prompt asked for — "a
+ * reply", which in the model's learned sense ends with what the company will
+ * do. v3 asks instead for the INFORMATIONAL HALF of a reply, with the agent
+ * owning the half that commits anyone, so omitting a company action completes
+ * the task rather than leaving it unfinished. Measured 0/6 and 0/6.
+ */
+export const COPILOT_PROMPT_VERSION = 'copilot-v3';
 
 /**
  * Evidence budget, split by kind.
@@ -107,6 +122,14 @@ export type CopilotOutcome =
   | 'no_evidence'
   | 'provider_timeout'
   | 'provider_unavailable'
+  /**
+   * ⚠️ The provider read this exact prompt and REFUSED it — Azure's content
+   * management policy, arriving as HTTP 400 upstream. Distinct from
+   * `provider_unavailable` because nothing is down and a retry can only fail
+   * again: an operator chasing an outage here would find none, and a caller
+   * treating it as transient would be wrong. Nothing retries either one.
+   */
+  | 'provider_refused'
   | 'malformed'
   | 'invalid_citation'
   | 'not_configured';

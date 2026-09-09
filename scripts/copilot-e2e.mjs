@@ -211,7 +211,7 @@ async function main() {
       const leaked = ID_SHAPED.exec(JSON.stringify(first.body));
       check('the response carries no identifier', leaked === null, leaked?.[0]);
     }
-    check('records the prompt version', first.body.diagnostics?.prompt_version === 'copilot-v1');
+    check('records the prompt version', first.body.diagnostics?.prompt_version === 'copilot-v3');
     console.log(`      ${first.ms}ms  outcome=${first.body.outcome}  cited=[${first.body.citations}]`);
     console.log(`      draft: "${(first.body.draft ?? '').slice(0, 90).replace(/\n/g, ' ')}…"`);
 

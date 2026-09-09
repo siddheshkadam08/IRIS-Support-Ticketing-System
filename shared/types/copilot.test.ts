@@ -217,6 +217,6 @@ describe('bounds', () => {
   });
 
   it('pins the prompt version', () => {
-    expect(COPILOT_PROMPT_VERSION).toBe('copilot-v1');
+    expect(COPILOT_PROMPT_VERSION).toBe('copilot-v3');
   });
 });

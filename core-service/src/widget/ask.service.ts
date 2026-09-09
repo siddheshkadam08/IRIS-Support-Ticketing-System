@@ -1,4 +1,4 @@
-import { newId, type AskAnswer, type AskResponse } from '@iris/shared/types';
+import { newId, RAG_PROMPT_VERSION, type AskAnswer, type AskResponse } from '@iris/shared/types';
 import type { Tx } from '../db/with-scope.js';
 import type { ProductConfig } from '../products/product.repo.js';
 import { hybridSearch } from '../retrieval/hybrid.service.js';
@@ -183,6 +183,16 @@ export async function ask(
       citation_count: ragResult.citationCount,
       rag_ms: ragResult.latencyMs,
       answer_chars: grounded?.answer.length ?? 0,
+      /**
+       * ⚠️ PROVENANCE. The synchronous AI features write no `ai_execution`
+       * row — that table is keyed `UNIQUE(event_id, feature)` on an outbox
+       * event these paths do not have — so the LOG LINE is where "which model,
+       * which prompt" is recorded for a generated answer. Pinned here rather
+       * than left implicit, because a behaviour change months from now has to
+       * be attributable to a version. See §44I of the master document.
+       */
+      model: grounded ? 'azure/gpt-4.1' : null,
+      prompt_version: RAG_PROMPT_VERSION,
     },
     'deflection grounding',
   );

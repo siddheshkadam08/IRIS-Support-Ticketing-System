@@ -206,10 +206,51 @@ async function main() {
     );
   }
   {
-    const { body } = await ask('CARB-1011', 'prod_carbon', 'a-different-raiser');
+    /**
+     * ⚠️ WITH POSITIVE CONTROLS. The bare-reference form of this check was
+     * vacuous: a stranger asking "CARB-1011" gets an EMPTY answer list, and
+     * `[].every(...)` is true — so it passed identically whether raiser
+     * isolation worked or retrieval was broken outright.
+     *
+     * Control 1: the OWNER sees the ticket for that same bare query.
+     * Control 2: the stranger does get results from the system, using a query
+     * that carries real article terms. The exact-reference pin fires only when
+     * the whole query IS a reference, so the mixed query surfaces the ticket
+     * for nobody — which is why control 2 asserts results, not the ticket.
+     */
+    const BARE = 'CARB-1011';
+    const MIXED = 'CARB-1011 I cannot sign in because my password is not accepted';
+
+    const ownerBare = (await ask(BARE, 'prod_carbon', 'usr_seed_4')).body.answers ?? [];
+    const strangerBare = (await ask(BARE, 'prod_carbon', 'a-different-raiser')).body;
+    const strangerMixed = (await ask(MIXED, 'prod_carbon', 'a-different-raiser')).body;
+    const bareAnswers = strangerBare.answers ?? [];
+    const mixedAnswers = strangerMixed.answers ?? [];
+
     check(
-      'a stranger naming a reference exactly gets no ticket evidence',
-      (body.answers ?? []).every((a) => a.type !== 'resolved_ticket'),
+      'POSITIVE CONTROL — the OWNER sees their own ticket for this exact query',
+      ownerBare.some((a) => a.type === 'resolved_ticket'),
+      JSON.stringify(ownerBare.map((a) => a.type)),
+    );
+    check(
+      'POSITIVE CONTROL — the stranger DOES get results from the same system',
+      mixedAnswers.length > 0,
+      `${mixedAnswers.length} answers — zero here would make the checks below vacuous`,
+    );
+    check(
+      'a stranger naming a reference exactly gets NO ticket evidence',
+      bareAnswers.every((a) => a.type !== 'resolved_ticket'),
+      JSON.stringify(bareAnswers.map((a) => a.type)),
+    );
+    check(
+      'and none when the reference is buried in a query that DOES retrieve',
+      mixedAnswers.length > 0 && mixedAnswers.every((a) => a.type !== 'resolved_ticket'),
+      JSON.stringify(mixedAnswers.map((a) => a.type)),
+    );
+    check(
+      "the stranger's grounded answer cites only what they were shown",
+      (strangerMixed.grounded_answer?.cited ?? []).every((c) => c >= 1 && c <= mixedAnswers.length),
+      JSON.stringify(strangerMixed.grounded_answer?.cited ?? []),
     );
   }
 

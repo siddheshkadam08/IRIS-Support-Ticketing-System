@@ -235,8 +235,8 @@ class TestNoSendCapability:
         """Belt as well as braces. The structure makes sending impossible; the
         prompt stops the model writing as if it had already acted."""
         system = build_system_prompt(count=3)
-        assert "A human always reviews your draft" in system
-        assert "review, edit and send" in system
+        assert "for a human support agent to finish and send" in system
+        assert "THE AGENT'S HALF" in system
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -479,8 +479,7 @@ class TestPrompt:
 
     def test_the_prompt_forbids_outside_knowledge(self):
         system = build_system_prompt(count=3)
-        assert "Do not use outside knowledge" in system
-        assert "do not invent facts" in system
+        assert "No outside knowledge, no invented facts" in system
         assert "Never claim a source says something it does not say" in system
 
     def test_the_prompt_allows_an_HONEST_EMPTY_CITATION_LIST(self):
@@ -494,27 +493,128 @@ class TestPrompt:
     def test_the_prompt_WEIGHTS_A_PAST_TICKET_AS_ONE_ANECDOTE(self):
         system = build_system_prompt(count=3)
         assert "ONE THING THAT HAPPENED ONCE" in system
-        assert "does NOT prove the same cause or the same fix applies now" in system
+        assert "does not prove the same cause or fix applies now" in system
         assert "a similar issue was previously caused by" in system
 
     @pytest.mark.parametrize(
-        "promise",
+        "prohibited",
         [
-            "that the issue is fixed, resolved or closed",
-            "restarted, reset, refunded or credited",
-            "engineering is working on it",
-            "any date, deadline, compensation, refund or service credit",
-            "any commitment about what the company will do",
+            "escalating",
+            "logging",
+            "forwarding",
+            "passing on",
+            "investigating",
+            "following up",
+            "getting back to them",
+            "contacting them",
+            "fixing",
+            "refunding",
+            "crediting",
+            "deleting",
+            "scheduling",
+            "responding by a given time",
         ],
     )
-    def test_the_prompt_FORBIDS_COMMITMENTS_A_HUMAN_MUST_MAKE(self, promise):
-        """⚠️ The most likely real-world harm from this feature is not a leaked
-        identifier — it is a fluent draft promising a refund by Friday, waved
-        through by a busy agent."""
+    def test_the_prompt_ENUMERATES_prohibited_company_actions(self, prohibited):
+        """The enumeration survives from v2, but it is now a SHORT list under a
+        redefined task rather than the whole defence.
+
+        v2 made the enumeration carry everything and was measured failing 5/6 on
+        a refund demand and 6/6 on an account deletion, because the enumeration
+        was arguing with the deliverable the same prompt had asked for.
+        """
         system = build_system_prompt(count=3)
-        assert "NEVER STATE OR IMPLY" in system
-        assert promise in system
-        assert "Those are decisions for a human, not for you" in system
+        assert "PROHIBITED CONTENT" in system
+        assert prohibited in system.lower()
+
+    def test_the_TASK_is_the_informational_half_not_a_whole_reply(self):
+        """⚠️ THE ACTUAL FIX, and the thing that must not regress.
+
+        v3 stopped asking for "a reply" — which in the model's learned sense
+        ends with what the company will do — and asked for the informational
+        half of one, with the agent owning the other half. Omitting a company
+        action became task COMPLETION rather than an unfinished reply, so there
+        is no helpfulness pressure left to resolve.
+
+        Measured: refund demand 5/6 -> 0/6, account deletion 6/6 -> 0/6.
+        """
+        system = build_system_prompt(count=3)
+        assert "INFORMATIONAL HALF" in system
+        assert "THE AGENT'S HALF" in system
+        assert "COMPLETE and correct piece of work" in system
+        # And the role framing comes before anything else.
+        assert system.startswith("ROLE")
+
+    def test_the_output_schema_ALSO_describes_the_informational_half(self):
+        """The field description is part of the JSON schema the model receives,
+        so it is part of the task definition. It said "A reply to the customer"
+        while the instructions asked for half of one — and the schema, being
+        closest to the output, won."""
+        description = CopilotOutput.model_json_schema()["properties"]["draft"]["description"]
+        assert "INFORMATIONAL HALF" in description
+        assert "NO statement of what the company" in description
+
+    def test_ALLOWED_CONTENT_is_a_closed_list(self):
+        """A whitelist of four content types, rather than an open task with
+        exceptions carved out of it."""
+        system = build_system_prompt(count=3)
+        assert "ALLOWED CONTENT" in system
+        assert "nothing else" in system
+        for item in ("What the sources say", "A step the CUSTOMER can take",
+                     "A specific question or detail you need FROM the customer",
+                     "cannot be confirmed here"):
+            assert item in system
+
+    def test_the_prompt_refuses_the_SUBSTITUTE_PROMISE(self):
+        """The specific failure mode: declining the demand and then offering an
+        escalation as consolation."""
+        system = build_system_prompt(count=3)
+        assert "NOT a gentler way" in system
+        assert "never a substitute promise" in system
+
+    def test_the_prompt_carries_a_CUSTOMER_NEXT_STEP_rule(self):
+        system = build_system_prompt(count=3)
+        assert "CUSTOMER-NEXT-STEP RULE" in system
+        assert "say what the CUSTOMER can do next" in system
+
+    def test_the_prompt_requires_SELF_REVIEW_of_every_sentence(self):
+        """A generation instruction, not a runtime validator — there is no
+        post-generation filter anywhere in this path."""
+        system = build_system_prompt(count=3)
+        assert "SELF-REVIEW" in system
+        assert "will take an action?" in system
+        assert "Check the LAST sentence hardest" in system
+
+    def test_the_prompt_requires_CONFLICTS_to_be_surfaced(self):
+        """B-3: parity with the Phase 13 RAG rule. Copilot inherited the
+        evidence model but not the contradiction rule, and was measured
+        presenting one of two conflicting causes as settled fact."""
+        system = build_system_prompt(count=3)
+        assert "CONTRADICTION HANDLING" in system
+        assert "do not silently pick one" in system
+        assert "give both with their citations" in system
+
+    def test_the_prompt_is_STRUCTURED_not_accreted(self):
+        """v2 grew to 6,141 characters by accretion, stating the same
+        prohibition four times. v3 is shorter and sectioned; the sections are
+        asserted in order so a future edit cannot quietly reorder the task
+        definition behind the prohibitions again.
+        """
+        system = build_system_prompt(count=3)
+        sections = [
+            "ROLE",
+            "TASK",
+            "AUTHORIZED EVIDENCE",
+            "ALLOWED CONTENT",
+            "PROHIBITED CONTENT",
+            "CONTRADICTION HANDLING",
+            "CUSTOMER-NEXT-STEP RULE",
+            "SELF-REVIEW",
+            "OUTPUT FORMAT",
+        ]
+        positions = [system.index(name) for name in sections]
+        assert positions == sorted(positions), "prompt sections are out of order"
+        assert len(system) < 6141, "v3 must not regrow into v2 by accretion"
 
     def test_the_prompt_names_the_ticket_and_sources_as_UNTRUSTED_DATA(self):
         system = build_system_prompt(count=3)
@@ -565,7 +665,7 @@ class TestPrompt:
             assert forbidden not in system
 
     def test_the_prompt_version_is_recorded(self):
-        assert COPILOT_PROMPT_VERSION == "copilot-v1"
+        assert COPILOT_PROMPT_VERSION == "copilot-v3"
 
 
 # ═════════════════════════════════════════════════════════════════════════

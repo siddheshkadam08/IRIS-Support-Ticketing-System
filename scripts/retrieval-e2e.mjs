@@ -121,12 +121,53 @@ async function main() {
      * restricts a raiser to rows where `raised_by_ref = app_raiser()`, so a
      * different raiser naming the reference EXACTLY must still get nothing —
      * precision must not become a way to read someone else's ticket.
+     *
+     * ⚠️ WITH TWO POSITIVE CONTROLS, because the obvious form of this check is
+     * vacuous. A stranger asking the bare reference gets an EMPTY answer list —
+     * nothing matches "CARB-1011" lexically once the exact lookup is denied —
+     * and `[].every(...)` is true. That assertion passed identically whether
+     * isolation worked or retrieval was broken end to end.
+     *
+     * Control 1 runs the SAME bare query as the owner, who must see the ticket.
+     * Control 2 proves the stranger is not simply getting nothing from the
+     * system, using a query that carries real article terms as well.
+     *
+     * ⚠️ Control 2 deliberately does NOT expect the ticket for the owner: the
+     * exact-reference pin fires only when the whole query IS a reference, so a
+     * mixed query cannot surface it for anyone. An earlier version asserted
+     * otherwise and failed — the system is right and the assertion was wrong.
      */
-    const { body } = await ask('prod_carbon', 'CARB-1011', 'someone-else');
+    const BARE = 'CARB-1011';
+    const MIXED = 'CARB-1011 I cannot sign in because my password is not accepted';
+
+    const ownerBare = ((await ask('prod_carbon', BARE, 'usr_seed_4')).body.answers ?? []);
+    const strangerBare = ((await ask('prod_carbon', BARE, 'someone-else')).body.answers ?? []);
+    const strangerMixed = ((await ask('prod_carbon', MIXED, 'someone-else')).body.answers ?? []);
+
     check(
-      'a DIFFERENT raiser naming the same reference gets nothing',
-      (body.answers ?? []).every((a) => a.type !== 'resolved_ticket'),
-      JSON.stringify(body.answers),
+      'POSITIVE CONTROL — the OWNER sees their own ticket for this exact query',
+      ownerBare.some((a) => a.type === 'resolved_ticket'),
+      JSON.stringify(ownerBare.map((a) => a.type)),
+    );
+    check(
+      'POSITIVE CONTROL — the stranger DOES get results from the same system',
+      strangerMixed.length > 0,
+      `${strangerMixed.length} answers — zero here would make the checks below vacuous`,
+    );
+    check(
+      'a DIFFERENT raiser naming the same reference gets NO ticket evidence',
+      strangerBare.every((a) => a.type !== 'resolved_ticket'),
+      JSON.stringify(strangerBare.map((a) => a.type)),
+    );
+    check(
+      'and gets none when the reference is buried in a query that DOES retrieve',
+      strangerMixed.length > 0 && strangerMixed.every((a) => a.type !== 'resolved_ticket'),
+      JSON.stringify(strangerMixed.map((a) => a.type)),
+    );
+    console.log(
+      `      owner(bare): ${ownerBare.length} [${[...new Set(ownerBare.map((a) => a.type))]}]` +
+        `   stranger(bare): ${strangerBare.length}` +
+        `   stranger(mixed): ${strangerMixed.length} [${[...new Set(strangerMixed.map((a) => a.type))]}]`,
     );
   }
 

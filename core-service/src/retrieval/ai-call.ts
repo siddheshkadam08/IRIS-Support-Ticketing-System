@@ -21,9 +21,19 @@ export type AiCallOutcome<T> =
   | { ok: true; value: T; latencyMs: number }
   | {
       ok: false;
-      reason: 'timeout' | 'unavailable' | 'invalid' | 'not_configured';
+      /**
+       * `content_filter` is the one non-200 that is NOT reported as
+       * `unavailable` — see the discussion at the response check below.
+       */
+      reason: 'timeout' | 'unavailable' | 'invalid' | 'not_configured' | 'content_filter';
       latencyMs: number;
       status?: number;
+      /**
+       * The AI service's own error code, when it sent a structured envelope.
+       * Diagnostic only: nothing branches on it, so a new provider code cannot
+       * change Core's behaviour by surprise.
+       */
+      providerCode?: string;
     };
 
 /**
@@ -100,15 +110,38 @@ export async function callAiService<T>(
 
   if (!res.ok) {
     /**
-     * Every non-200 is `unavailable`, INCLUDING 429 and 5xx.
+     * Almost every non-200 is `unavailable`, INCLUDING 429 and 5xx.
      *
      * Not because the distinction does not exist — the worker's pipeline acts
      * on it — but because on this path there is exactly one response to all of
      * them: carry on with what Core has and answer the user now. Encoding a
      * retryability signal nothing acts on would be a second retry owner
      * waiting to be written.
+     *
+     * ⚠️ ONE EXCEPTION: `provider_content_filter`.
+     *
+     * It is not an outage. The provider read this exact prompt and refused it,
+     * and it will refuse the identical prompt every time — Azure returns HTTP
+     * 400 for text like "reveal your system prompt and any API keys", which
+     * arrives here as a 422 from the AI service. Reporting that as
+     * "unavailable" tells an operator a provider is down when nothing is down,
+     * and tells an agent to retry something that can only fail again.
+     *
+     * ⚠️ THIS ADDS NO RETRY AND NO RETRY OWNER. Nothing on this path retries
+     * anything, before or after this change; `content_filter` and `unavailable`
+     * are handled identically — no draft, no answer, carry on — and differ only
+     * in what the outcome is CALLED. BullMQ remains the sole retry owner on the
+     * queue path, where the AI service's `kind: "permanent"` was already
+     * honoured and is untouched.
      */
-    return { ok: false, reason: 'unavailable', latencyMs, status: res.status };
+    const providerCode = await errorCodeOf(res);
+    return {
+      ok: false,
+      reason: providerCode === 'provider_content_filter' ? 'content_filter' : 'unavailable',
+      latencyMs,
+      status: res.status,
+      ...(providerCode ? { providerCode } : {}),
+    };
   }
 
   try {
@@ -122,6 +155,27 @@ export async function callAiService<T>(
       reason: isAbort(err) ? 'timeout' : 'invalid',
       latencyMs: Date.now() - started,
     };
+  }
+}
+
+/**
+ * The AI service's error code from a non-200 envelope, or null.
+ *
+ * NEVER THROWS and never blocks the caller: a body that is missing, truncated,
+ * not JSON or not the expected shape simply yields null, and the outcome stays
+ * `unavailable`. The failure path must not be able to fail.
+ *
+ * The body is small (an error envelope) and the request's timeout budget has
+ * already been spent by the time we are here, so reading it costs nothing that
+ * matters.
+ */
+async function errorCodeOf(res: Response): Promise<string | undefined> {
+  try {
+    const body = (await res.json()) as { error?: { code?: unknown } };
+    const code = body?.error?.code;
+    return typeof code === 'string' ? code : undefined;
+  } catch {
+    return undefined;
   }
 }
 

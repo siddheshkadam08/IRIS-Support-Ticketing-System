@@ -701,7 +701,7 @@ describe('the response', () => {
       'ticket_comments',
       'total_ms',
     ]);
-    expect(d.prompt_version).toBe('copilot-v1');
+    expect(d.prompt_version).toBe('copilot-v3');
     expect(typeof d.total_ms).toBe('number');
   });
 

@@ -3,6 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   api,
+  type AssigneeSuggestion,
   type CopilotDraft,
   type Delivery,
   type Grant,
@@ -66,6 +67,28 @@ export default function TicketDetail() {
     queryKey: ['ticket-similar', id],
     queryFn: () => api.similarTickets(id!),
     enabled: Boolean(id),
+    retry: false,
+    staleTime: 60_000,
+  });
+
+  /**
+   * Phase 16 — Suggested Assignees.
+   *
+   * ⚠️ Only fetched for roles the endpoint accepts. An agent may assign only
+   * themselves, and RLS hides other staff from them, so asking would produce a
+   * 403 and a console error for a panel they cannot use.
+   *
+   * Same caching and silent-failure posture as Similar Tickets: it is a
+   * supporting panel, and nobody should be blocked from working a ticket
+   * because an optional lookup failed.
+   */
+  const canSeeSuggestions =
+    me?.role === 'manager' || me?.role === 'product_admin' || me?.role === 'super_admin';
+
+  const { data: suggested, isLoading: suggestedLoading } = useQuery({
+    queryKey: ['ticket-suggested-assignees', id],
+    queryFn: () => api.suggestedAssignees(id!),
+    enabled: Boolean(id) && canSeeSuggestions,
     retry: false,
     staleTime: 60_000,
   });
@@ -420,6 +443,42 @@ export default function TicketDetail() {
             )}
           </Card>
 
+          {canSeeSuggestions ? (
+            <Card title="Suggested assignees">
+              {suggestedLoading ? (
+                <div style={{ fontSize: 12.5, color: 'var(--muted)' }}>Looking for evidence…</div>
+              ) : !suggested || suggested.suggestions.length === 0 ? (
+                <div style={{ fontSize: 12.5, color: 'var(--muted)' }}>
+                  {suggested?.caveats[0] ?? 'No staff are scoped to this product.'}
+                </div>
+              ) : (
+                <>
+                  {suggested.suggestions.map((s) => (
+                    <SuggestionCard key={s.support_user_id} item={s} />
+                  ))}
+                  {/*
+                    ⚠️ Says what the list IS and who decides. These are people
+                    with relevant history, ordered by that history — not a
+                    ranking of who is better at their job.
+                  */}
+                  <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 8, lineHeight: 1.4 }}>
+                    Suggested assignees, with the evidence behind each. The
+                    assignment decision is yours.
+                    <div style={{ marginTop: 4 }}>
+                      These are evidence-based suggestions, not measured agent
+                      performance rankings.
+                    </div>
+                    {suggested.caveats.map((c) => (
+                      <div key={c} style={{ marginTop: 4 }}>
+                        {c}
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </Card>
+          ) : null}
+
           <Card title="Similar tickets">
             {similarLoading ? (
               <div style={{ fontSize: 12.5, color: 'var(--muted)' }}>Looking for precedents…</div>
@@ -500,6 +559,102 @@ function CopilotNote({ info, edited }: { info: CopilotDraft; edited: boolean }) 
               </li>
             ))}
           </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * One suggested assignee — Phase 16.
+ *
+ * ⚠️ SHOWS EVIDENCE, NOT A VERDICT. There is no score, no percentage and no
+ * confidence, because none exists: the ordering is three counts compared
+ * lexicographically. The strongest thing this card may say is what the person
+ * has previously handled.
+ *
+ * ⚠️ NO ASSIGN BUTTON. Clicking a suggestion must never assign anyone —
+ * assignment stays the existing control above, which carries its own
+ * authorization. Keeping this panel strictly read-only means a misread
+ * suggestion cannot become an action.
+ */
+function SuggestionCard({ item }: { item: AssigneeSuggestion }) {
+  // Deliberately verbal, never numeric. "strong" describes the EVIDENCE.
+  const strength: Record<AssigneeSuggestion['evidence_strength'], string> = {
+    strong: 'Strong evidence',
+    moderate: 'Moderate evidence',
+    limited: 'Limited evidence',
+    none: 'No relevant historical evidence',
+  };
+
+  return (
+    <div
+      style={{
+        borderTop: '1px solid var(--line)',
+        paddingTop: 8,
+        marginTop: 8,
+        fontSize: 12.5,
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+        <strong>
+          {item.rank}. {item.display_name}
+        </strong>
+        <span style={{ color: 'var(--muted)', whiteSpace: 'nowrap' }}>{item.role}</span>
+      </div>
+
+      <div style={{ marginTop: 2 }}>{item.summary}</div>
+
+      <div style={{ color: 'var(--muted)', marginTop: 4, lineHeight: 1.5 }}>
+        {/*
+          ⚠️ THE TWO NUMBERS MEAN DIFFERENT THINGS, and showing only the first
+          overstated the second.
+
+            evidence strength — HOW MUCH evidence there is (a count)
+            best similarity   — HOW RELEVANT the closest piece of it is
+
+          Measured: an unmatchable ticket still returns the five nearest
+          historical tickets, so a candidate who handled them reads as "Strong
+          evidence" at similarities of 0.19-0.21. There is deliberately no
+          similarity floor (Phase 14 measured that any absolute threshold
+          encodes the seed data), so the number is shown instead and the reader
+          judges — the same choice the Similar Tickets panel makes.
+
+          ⚠️ It is NOT a confidence score and must never be labelled one.
+        */}
+        <div>
+          {strength[item.evidence_strength]}
+          {item.factors.similar_tickets.best_similarity !== null ? (
+            <>
+              {' · '}
+              <span title="How closely the nearest historical ticket resembles this one. A retrieval score, not a confidence.">
+                Best similarity: {item.factors.similar_tickets.best_similarity.toFixed(2)}
+              </span>
+            </>
+          ) : null}
+        </div>
+        <div>{item.factors.category_experience.label}
+          {item.factors.category_experience.category
+            ? ` in ${item.factors.category_experience.category}`
+            : ''}
+        </div>
+        <div>{item.factors.active_tickets.label}</div>
+      </div>
+
+      {item.evidence.length > 0 ? (
+        <div style={{ marginTop: 4 }}>
+          <span style={{ color: 'var(--muted)' }}>Evidence: </span>
+          {/*
+            Each reference carries its own similarity, so a row at 0.19 is
+            visibly weaker than one at 0.79 without the reader opening it.
+          */}
+          {item.evidence.map((e, i) => (
+            <span key={e.reference}>
+              {i > 0 ? ', ' : ''}
+              <span title={e.title}>{e.reference}</span>
+              <span style={{ color: 'var(--muted)' }}> ({e.similarity.toFixed(2)})</span>
+            </span>
+          ))}
         </div>
       ) : null}
     </div>

@@ -15,6 +15,7 @@ import {
 import { deliveriesForTicket, grantsForTicket, issueGrants, revokeGrants } from '../access/grant.service.js';
 import { findSimilar } from '../tickets/similar.service.js';
 import { draftReply } from '../tickets/copilot.service.js';
+import { suggestAssignees } from '../tickets/suggested-assignees.service.js';
 import { config } from '../config.js';
 import { assertTenant, requireRole, resolveAdminCaller } from './admin.context.js';
 
@@ -159,6 +160,57 @@ export async function adminTicketRoutes(app: FastifyInstance): Promise<void> {
       };
     });
   });
+
+  // ── GET /admin/tickets/:id/suggested-assignees ─────────────────────────
+  //
+  // "Who could take this, and what is the evidence?"
+  //
+  // ⚠️ READ-ONLY, and no audit event — the same rule as /similar above.
+  // Nothing auditable happened: no ticket changed, no comment was written, no
+  // assignment was made. Fabricating an event to make the feature look governed
+  // would put noise in an append-only compliance log.
+  //
+  // ⚠️ NOT AI. No model, no prompt, no Python call. Three counts and a total
+  // order over them.
+  //
+  // ⚠️ A SUGGESTION IS NOT AN AUTHORIZATION. Assignment remains POST
+  // /assign below, which re-validates caller scope, tenant, role and the state
+  // machine independently of anything suggested here.
+  app.get<{ Params: { id: string } }>(
+    '/admin/api/tickets/:id/suggested-assignees',
+    async (req) => {
+      const caller = resolveAdminCaller(req);
+      /**
+       * ⚠️ AGENTS ARE EXCLUDED, for two independent measured reasons.
+       *
+       * The assign endpoint below permits an agent to assign only THEMSELVES,
+       * so suggestions are unactionable for them; and `scope_visibility` lets
+       * an agent read only their own support_user_scope rows, so the candidate
+       * join would return at most the caller. The feature would be a one-item
+       * list of yourself.
+       */
+      requireRole(caller, 'manager', 'product_admin', 'super_admin');
+
+      const q = req.query as Record<string, string | undefined>;
+
+      return withScope(caller.scope, async (tx) => {
+        const result = await suggestAssignees(tx, {
+          ticketId: req.params.id,
+          requestId: caller.scope.requestId,
+          // Optional narrowing for a genuinely tenant-bound caller, with the
+          // same semantics as /similar. Support staff serve the whole product.
+          productTenantId: q.product_tenant_id ?? null,
+        });
+
+        // null means the ticket is not visible under this scope. 404 rather
+        // than 403, so an unauthorized id cannot be used to probe for
+        // existence — matching /similar and /copilot/draft.
+        if (!result) throw notFound();
+
+        return result;
+      });
+    },
+  );
 
   // ── POST /admin/tickets/:id/assign ─────────────────────────────────────
   // The transition that fires the dual JIT grant.

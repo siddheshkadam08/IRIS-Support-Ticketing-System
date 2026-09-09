@@ -298,6 +298,50 @@ export interface CopilotDraft {
   };
 }
 
+
+/**
+ * Phase 16 — Suggested Assignees.
+ *
+ * ⚠️ NOT AI. No model, no prompt, no score: three counts and a total order over
+ * them, computed in Core. The wording in the UI must stay "suggested" and
+ * "evidence" — never "best agent", "AI ranking", "expertise" or a percentage.
+ */
+export interface AssigneeSuggestion {
+  rank: number;
+  support_user_id: string;
+  display_name: string;
+  role: 'agent' | 'product_admin' | 'manager';
+  evidence_strength: 'strong' | 'moderate' | 'limited' | 'none';
+  summary: string;
+  factors: {
+    similar_tickets: { count: number; best_similarity: number | null; label: string };
+    category_experience: { count: number; label: string; category: string | null };
+    active_tickets: { count: number; scope: 'all products'; label: string };
+  };
+  evidence: Array<{
+    reference: string;
+    title: string;
+    similarity: number;
+    resolved_at: string | null;
+  }>;
+}
+
+export interface SuggestedAssigneesResponse {
+  suggestions: AssigneeSuggestion[];
+  caveats: string[];
+  diagnostics: {
+    eligible_candidates: number;
+    suggestions_returned: number;
+    similar_hits: number;
+    similar_outcome: string;
+    historical_corpus: number;
+    embed_ms: number | null;
+    total_ms: number;
+    algorithm_version: string;
+    outcome: string;
+  };
+}
+
 export const api = {
   login: (email: string, password: string) =>
     request<{ user: Me }>('POST', '/admin/api/auth/login', { email, password }),
@@ -320,6 +364,13 @@ export const api = {
    */
   similarTickets: (id: string) =>
     request<SimilarTicketsResponse>('GET', `/admin/api/tickets/${id}/similar`),
+  /**
+   * Phase 16 — who could take this ticket, and the evidence behind each.
+   * Read-only: it changes nothing and assigns nobody. Assignment stays
+   * `assign()` below, which the human triggers separately.
+   */
+  suggestedAssignees: (id: string) =>
+    request<SuggestedAssigneesResponse>('GET', `/admin/api/tickets/${id}/suggested-assignees`),
   /**
    * Phase 15 — generate a DRAFT reply. This does not send anything and creates
    * no comment; sending is `comment()` below, which the agent must trigger

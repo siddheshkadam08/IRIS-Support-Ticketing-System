@@ -76,6 +76,7 @@ interface Row {
   similarity: string;
   resolution: string | null;
   resolved_at: Date | null;
+  assignee_id: string | null;
 }
 
 /**
@@ -88,6 +89,22 @@ interface Row {
  * Ordering: cosine distance, then `reference` as a total tiebreak. Ties are
  * guaranteed here rather than hypothetical — duplicate seeded tickets produce
  * byte-identical text and therefore identical embeddings.
+ *
+ * ⚠️ PHASE 16 ADDED `assignee_id` TO THE PROJECTION — nothing else.
+ *
+ * Suggested Assignees needs to know who handled each similar ticket. Computing
+ * that with a second query would mean two copies of HISTORICAL_CORPUS, which is
+ * exactly the duplication Phases 11-15 avoided. The corpus predicate, ordering,
+ * limit, similarity semantics, internal-comment filtering and failure behaviour
+ * are untouched, so every Phase 14 property holds unchanged, and the column was
+ * already inside this scan.
+ *
+ * It is a deliberate widening of the admin /similar response.
+ * `similar.integration.test.ts` permits this field by name and still rejects
+ * ticket ids, product ids, tenant ids and raiser references.
+ *
+ * ⚠️ Do not put backticks in the SQL template literal below — one in a comment
+ * silently terminates the string and the query becomes JavaScript.
  */
 export async function findSimilarTickets(
   tx: Tx,
@@ -105,7 +122,9 @@ export async function findSimilarTickets(
             t.status,
             1 - (t.embedding <=> $1::vector)             AS similarity,
             ${LATEST_PUBLIC_REPLY}                       AS resolution,
-            coalesce(t.resolved_at, t.closed_at)         AS resolved_at
+            coalesce(t.resolved_at, t.closed_at)         AS resolved_at,
+            -- Phase 16: who handled it. See the note above this function.
+            t.assignee_id                                AS assignee_id
        FROM ticket t
       WHERE ${HISTORICAL_CORPUS}
       ORDER BY t.embedding <=> $1::vector, t.reference
@@ -126,6 +145,7 @@ export async function findSimilarTickets(
     similarity: Math.round(Number(r.similarity) * 10_000) / 10_000,
     resolution: r.resolution,
     resolved_at: r.resolved_at ? r.resolved_at.toISOString() : null,
+    assignee_id: r.assignee_id,
   }));
 }
 

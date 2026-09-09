@@ -262,11 +262,25 @@ describe('the historical corpus', () => {
     const res = await scoped(staff(PRODUCT_A), (tx) =>
       findSimilar(tx, { ticketId: current.id, requestId: 'r', embed: provider(seedVector) }),
     );
+    /**
+     * ⚠️ `assignee_id` IS PERMITTED HERE — added deliberately in Phase 16, and
+     * narrowed rather than relaxed.
+     *
+     * Suggested Assignees needs to know who handled each similar ticket, and
+     * recomputing that with a second retrieval path would duplicate the
+     * historical-corpus predicate. So this DTO carries exactly ONE internal
+     * identifier, named explicitly below.
+     *
+     * Everything else is still rejected: ticket ids, product ids, tenant ids
+     * and raiser references. The key-set assertion is the real control — a
+     * future field cannot slip in unnoticed, because the list is exhaustive.
+     */
     const raw = JSON.stringify(res!.items);
     for (const forbidden of ['tkt_', 'prod_', 'acme-corp', 'raised_by_ref', 'product_tenant_id']) {
       expect(raw).not.toContain(forbidden);
     }
     expect(Object.keys(res!.items[0]!).sort()).toEqual([
+      'assignee_id',
       'reference',
       'resolution',
       'resolved_at',
@@ -274,6 +288,62 @@ describe('the historical corpus', () => {
       'status',
       'title',
     ]);
+  });
+
+  it('⚠️ carries the handler of each historical ticket, and nothing more about them', async () => {
+    /**
+     * The positive half of the assertion above: `assignee_id` must actually be
+     * populated, or Phase 16 would silently attribute nothing and its own
+     * isolation tests would pass vacuously.
+     */
+    const handled = await makeTicket({
+      productId: PRODUCT_A,
+      tenantId: TENANT_MAIN,
+      subject: 'Resolved by a known person',
+      description: 'A historical problem with a recorded handler.',
+      embeddingFrom: seedRef,
+    });
+    /**
+     * ⚠️ The support-user id is READ under a staff role and passed as a
+     * parameter, rather than sub-selected inside the UPDATE.
+     *
+     * `support_user_visibility` requires app_role() to be a support role, and
+     * the fixture scope used for ticket writes carries role 'none'. An inline
+     * sub-select therefore returned NULL and set assignee_id to NULL — silently,
+     * because UPDATE does not care. The assertions below caught it, which is
+     * the entire reason they check the value rather than just the shape.
+     */
+    const someUserId = await scoped(staff(PRODUCT_A), async (tx) => {
+      const { rows } = await tx.query<{ id: string }>(
+        `SELECT id FROM support_user WHERE is_active = true ORDER BY id LIMIT 1`,
+      );
+      return rows[0]!.id;
+    });
+    expect(someUserId, 'no support user to attribute the fixture to').toMatch(/^su_/);
+
+    await asProduct(PRODUCT_A, (tx) =>
+      tx.query(`UPDATE ticket SET assignee_id = $2 WHERE id = $1`, [handled.id, someUserId]),
+    );
+
+    const current = await makeTicket({
+      productId: PRODUCT_A,
+      tenantId: TENANT_MAIN,
+      subject: 'Current',
+      description: 'Anything.',
+      status: 'open',
+    });
+    const res = await scoped(staff(PRODUCT_A), (tx) =>
+      findSimilar(tx, { ticketId: current.id, requestId: 'r', limit: 20, embed: provider(seedVector) }),
+    );
+
+    const hit = res!.items.find((i) => i.reference === handled.reference);
+    expect(hit, 'the fixture must be retrieved or this proves nothing').toBeDefined();
+    // Populated, and shaped like a support-user id — not silently null, which
+    // would make every Phase 16 attribution test vacuous.
+    expect(typeof hit!.assignee_id).toBe('string');
+    expect(hit!.assignee_id!.startsWith('su_')).toBe(true);
+    // No name, no email, no role — the id alone, which Core resolves itself.
+    expect(JSON.stringify(res)).not.toContain('@');
   });
 
   it('bounds the limit', async () => {

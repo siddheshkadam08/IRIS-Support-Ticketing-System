@@ -61,6 +61,28 @@ export interface SimilarTicket {
    */
   resolution: string | null;
   resolved_at: string | null;
+  /**
+   * Who handled this historical ticket — added in Phase 16.
+   *
+   * ⚠️ THE ONE INTERNAL IDENTIFIER THIS DTO CARRIES, and it is deliberate.
+   * Suggested Assignees needs to know which eligible person resolved each
+   * similar ticket; recomputing that with a second retrieval path would mean
+   * two copies of the historical-corpus predicate, which is exactly what
+   * Phases 11-15 avoided.
+   *
+   * It is safe on this surface: `/admin/api/tickets/:id/similar` is admin-only
+   * and its callers can already enumerate these users through
+   * `listUsers()`. `similar.integration.test.ts` permits this field by name and
+   * still rejects ticket ids, product ids, tenant ids and raiser references.
+   *
+   * ⚠️ NOT rendered by the Similar Tickets UI, which shows references and
+   * resolutions. Naming the handler of another customer's ticket in a support
+   * panel is a different disclosure from using it to rank candidates.
+   *
+   * Null when the historical ticket was resolved with no assignee recorded —
+   * common in this corpus, and simply means it contributes no attribution.
+   */
+  assignee_id: string | null;
 }
 
 export interface SimilarTicketsResponse {

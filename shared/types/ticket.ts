@@ -28,6 +28,23 @@ export const CLASSIFICATION_SOURCES = [
   'ai_auto',
   'ai_uncertain',
   'unclassified',
+  /**
+   * Phase 20. A manager, product admin or super admin reviewed the
+   * classification and corrected it.
+   *
+   * The value names WHAT DECIDED, not who — the same shape as the members
+   * above, where `product` is an integrating system and `ai_auto` /
+   * `ai_uncertain` are the model at two confidence bands. Which roles may
+   * correct is an authorization question that can change without the meaning
+   * of this value changing with it.
+   *
+   * ⚠️ TERMINAL WITH RESPECT TO THE AI. `applyClassification` writes only
+   * `WHERE classification_source = 'unclassified'`, so once a row reaches
+   * `human` a late or replayed AI result matches nothing and cannot overwrite
+   * it. The before/after and the actor live in the audit trail under
+   * `ticket.classification_corrected`.
+   */
+  'human',
 ] as const;
 export type ClassificationSource = (typeof CLASSIFICATION_SOURCES)[number];
 

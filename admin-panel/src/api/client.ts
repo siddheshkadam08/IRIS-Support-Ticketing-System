@@ -240,7 +240,13 @@ export interface TicketDetail extends TicketRow {
    * jsonb written by the AI pipeline, so the UI reads it defensively rather
    * than pretending to know its shape.
    */
-  classification_source?: 'product' | 'ai_auto' | 'ai_uncertain' | 'unclassified';
+  /**
+   * Phase 20 adds `human`: a manager, product admin or super admin reviewed the
+   * classification and corrected it. Mirrors CLASSIFICATION_SOURCES in
+   * shared/types/ticket.ts — a value missing here renders as an unlabelled
+   * ticket rather than failing loudly, which is why the two must stay in step.
+   */
+  classification_source?: 'product' | 'ai_auto' | 'ai_uncertain' | 'unclassified' | 'human';
   ai_classification?: unknown;
   /**
    * Phase 19. One entry per screenshot the AI pipeline has processed for this
@@ -441,6 +447,30 @@ export const api = {
     request<TicketDetail>('POST', `/admin/api/tickets/${id}/assign`, { support_user_id }),
   setStatus: (id: string, status: string, reason?: string) =>
     request<TicketRow>('PATCH', `/admin/api/tickets/${id}/status`, { status, reason }),
+  /**
+   * Phase 20 — a human classification correction.
+   *
+   * ⚠️ `expected` IS THE CONCURRENCY GUARD, not a convenience. It carries the
+   * three values the reviewer had on screen, and the server refuses with 409 if
+   * any of them moved meanwhile. Callers must send what they SAW, never what
+   * they are about to write.
+   *
+   * Omitting `severity` asks the deterministic engine to derive it from the
+   * corrected category; supplying it is an explicit override, recorded as one.
+   */
+  correctClassification: (
+    id: string,
+    payload: {
+      category?: string;
+      severity?: string;
+      expected: {
+        category: string | null;
+        severity: string | null;
+        classification_source: string;
+      };
+    },
+  ) => request<TicketDetail>('PATCH', `/admin/api/tickets/${id}/classification`, payload),
+
   comment: (id: string, body: string, is_internal: boolean) =>
     request<{ id: string }>('POST', `/admin/api/tickets/${id}/comments`, { body, is_internal }),
 

@@ -1,6 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { AppError, SEVERITIES, TICKET_STATUSES, notFound, type TicketStatus } from '@iris/shared/types';
+import {
+  AppError,
+  CLASSIFICATION_SOURCES,
+  SEVERITIES,
+  TICKET_STATUSES,
+  notFound,
+  type TicketStatus,
+} from '@iris/shared/types';
 import { withScope } from '../db/with-scope.js';
 import { writeAudit } from '../audit/index.js';
 import { emitEvent } from '../events/outbox.js';
@@ -15,6 +22,7 @@ import {
 import { deliveriesForTicket, grantsForTicket, issueGrants, revokeGrants } from '../access/grant.service.js';
 import { findSimilar } from '../tickets/similar.service.js';
 import { draftReply } from '../tickets/copilot.service.js';
+import { correctClassification } from '../tickets/classification.correct.js';
 import { suggestAssignees } from '../tickets/suggested-assignees.service.js';
 import { storage } from '../storage/index.js';
 import { screenshotResultsForTicket } from '../tickets/screenshot.read.js';
@@ -30,6 +38,38 @@ const CommentBody = z.object({
   body: z.string().min(1).max(10_000),
   is_internal: z.boolean().default(false),
 });
+
+/**
+ * Phase 20 — a human classification correction.
+ *
+ * ⚠️ `expected` IS REQUIRED AND IS NOT A HINT. It carries the three values the
+ * reviewer actually saw, and becomes the compare-and-set guard on the UPDATE.
+ * Without it, two reviewers looking at the same stale page would each overwrite
+ * the other and both would be told they succeeded.
+ *
+ * ⚠️ `severity` IS OPTIONAL BECAUSE OMITTING IT MEANS SOMETHING. Omitted, the
+ * deterministic engine derives it from the corrected category; supplied, it is
+ * an explicit override of what the engine derived, recorded as one. Those are
+ * different decisions and the contract lets a reviewer express both.
+ *
+ * `.strict()` so a field this endpoint does not accept — `status`, `assignee_id`,
+ * `priority` — is a loud 400 rather than a silently ignored key that reads back
+ * unchanged and looks like a lost save.
+ */
+const ClassificationBody = z
+  .object({
+    category: z.string().min(1).max(80).optional(),
+    severity: z.enum(SEVERITIES).optional(),
+    expected: z.object({
+      category: z.string().max(80).nullable(),
+      severity: z.enum(SEVERITIES).nullable(),
+      classification_source: z.enum(CLASSIFICATION_SOURCES),
+    }),
+  })
+  .strict()
+  .refine((b) => b.category !== undefined || b.severity !== undefined, {
+    message: 'Send a category, a severity, or both.',
+  });
 
 export async function adminTicketRoutes(app: FastifyInstance): Promise<void> {
   // ── GET /admin/tickets ─────────────────────────────────────────────────
@@ -387,6 +427,51 @@ export async function adminTicketRoutes(app: FastifyInstance): Promise<void> {
       );
 
       return (await findTicket(tx, ticket.id))!;
+    });
+  });
+
+  /**
+   * ── PATCH /admin/api/tickets/:id/classification ──────────────────────
+   *
+   * Phase 20. The human half of "AI predicts, IRIS decides".
+   *
+   * ⚠️ WHY THIS ENDPOINT HAD TO EXIST. `applyClassification` writes a ticket's
+   * category and severity exactly once, and nothing could change them
+   * afterwards — so `ai_uncertain`, the band that means "a human should review
+   * this", was a label with no action behind it. 4,106 live tickets sat in it.
+   *
+   * ⚠️ MANAGER AND ABOVE, NOT AGENTS. Classification drives the deterministic
+   * priority engine and therefore routing, so correcting it is a supervisory
+   * decision rather than a triage convenience. An agent who disagrees raises it
+   * with a manager; Phase 20 deliberately builds no request-and-approve
+   * workflow, because a workflow nobody has asked for is a workflow nobody uses.
+   *
+   * A no-op returns 200 with the unchanged ticket and writes no audit row: a
+   * reviewer confirming a classification is correct has not corrected anything,
+   * and an audit trail that records confirmations cannot be read for changes.
+   */
+  app.patch<{ Params: { id: string } }>('/admin/api/tickets/:id/classification', async (req) => {
+    const caller = resolveAdminCaller(req);
+    requireRole(caller, 'manager', 'product_admin', 'super_admin');
+    const body = ClassificationBody.parse(req.body);
+
+    return withScope(caller.scope, async (tx) => {
+      const outcome = await correctClassification(tx, caller.scope, {
+        ticketRef: req.params.id,
+        ...(body.category !== undefined ? { category: body.category } : {}),
+        ...(body.severity !== undefined ? { severity: body.severity } : {}),
+        expected: body.expected,
+        /**
+         * Authorization runs against the product read from the TICKET ROW,
+         * never from the request. The writer loads the row and calls back with
+         * it, so `assertTenant` — which needs the caller — stays here at the
+         * boundary while the value it judges comes from the database.
+         */
+        authorize: (productId) => assertTenant(caller, productId),
+        sourceIp: req.ip,
+      });
+
+      return outcome.ticket;
     });
   });
 

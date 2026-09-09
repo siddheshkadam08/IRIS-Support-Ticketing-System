@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  ApiError,
   api,
   type AssigneeSuggestion,
   type CopilotDraft,
@@ -13,7 +14,7 @@ import {
 } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
 import { Banner, Card, Empty, PageFooter, Pill, Spinner, TenantChip } from '../components/ui';
-import { ACTION_LABEL, absTime, relTime } from '../lib/labels';
+import { ACTION_LABEL, SEVERITY_LABEL, absTime, relTime } from '../lib/labels';
 
 /**
  * The highest-value screen in the portal.
@@ -397,6 +398,21 @@ export default function TicketDetail() {
                   <span className="tag" title="Supplied by the product, not by AI">
                     product
                   </span>
+                ) : ticket.classification_source === 'human' ? (
+                  /*
+                    Phase 20. Visually distinct from the AI tags on purpose: an
+                    agent reading this needs to know at a glance that a person
+                    decided it, because the confidence figure beside it belongs
+                    to the model's original guess and no longer describes what
+                    the ticket says.
+                  */
+                  <span
+                    className="tag"
+                    style={{ background: '#dcfce7', color: '#166534' }}
+                    title="Reviewed and corrected by a manager. See the activity log for who and when."
+                  >
+                    human corrected
+                  </span>
                 ) : null}
                 {aiConfidence !== null ? (
                   <span style={{ color: 'var(--muted)', marginLeft: 6 }}>
@@ -408,6 +424,15 @@ export default function TicketDetail() {
               <dd>{ticket.assignee?.display_name ?? <span style={{ color: 'var(--muted)' }}>Unassigned</span>}</dd>
               {ticket.rating ? (<><dt>Rating</dt><dd>{'★'.repeat(ticket.rating)}</dd></>) : null}
             </dl>
+
+            {/*
+              Phase 20. The review control, inside the card that already shows
+              what is being reviewed. Deliberately not a separate card: an agent
+              correcting a category should be looking at the category.
+            */}
+            {can('super_admin', 'product_admin', 'manager') ? (
+              <CorrectClassification ticket={ticket} />
+            ) : null}
           </Card>
 
           <Card title="Assignment" style={{ marginBottom: 14 }}>
@@ -957,6 +982,149 @@ function ScreenshotEvidence({ result }: { result: ScreenshotResultDTO }) {
         Model-reported confidence {i.confidence.toFixed(2)} of 1. Self-reported by the
         model and not a measure of accuracy.
         {result.model ? ` · ${result.model}` : ''}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Human classification review — Phase 20.
+ *
+ * ⚠️ AI PREDICTS. HUMAN REVIEWS. IRIS DECIDES.
+ *
+ * Until this control existed, `ai_uncertain` — the band whose entire meaning is
+ * "a human should look at this" — was a label an agent could read and act on in
+ * no way at all. The model's answer stood permanently.
+ *
+ * ⚠️ SEVERITY IS OPTIONAL HERE, AND THE DEFAULT MATTERS.
+ *
+ * Leaving it on "derive" hands the outcome back to the deterministic priority
+ * engine, which is the normal case: correct the category, let IRIS decide what
+ * that means. Choosing a severity explicitly is an OVERRIDE of the engine, and
+ * is recorded as one in the audit trail — so the form says that plainly rather
+ * than presenting the two as the same act.
+ *
+ * ⚠️ ROLE GATING HERE IS CONVENIENCE. The API refuses an agent with a 403
+ * whether or not this control renders, exactly as with every other privileged
+ * surface in the panel.
+ */
+/** The four platform severities, in escalating order. Mirrors SEVERITIES. */
+const SEVERITY_OPTIONS = ['low', 'medium', 'high', 'critical'] as const;
+
+function CorrectClassification({ ticket }: { ticket: TDetail }) {
+  const qc = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [category, setCategory] = useState(ticket.category ?? '');
+  /** '' means "let the engine derive it" — not "no severity". */
+  const [severity, setSeverity] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+
+  /**
+   * The tenant's own category list, from the config endpoint that already
+   * exists. A correction must choose a value the product actually configured,
+   * for the same reason the AI's category is validated against it: a category
+   * outside the list is one no filter can match and no report can group by.
+   */
+  const tenantId = ticket.tenant?.id ?? null;
+  const { data: settings } = useQuery({
+    queryKey: ['widget-config', tenantId],
+    queryFn: () => api.widgetConfig(tenantId!),
+    enabled: open && Boolean(tenantId),
+  });
+  const categories = settings?.categories ?? [];
+
+  const save = useMutation({
+    mutationFn: () =>
+      api.correctClassification(ticket.id, {
+        ...(category && category !== ticket.category ? { category } : {}),
+        ...(severity ? { severity } : {}),
+        /**
+         * What the reviewer SAW, not what they are writing. This is the
+         * compare-and-set guard: if anything moved since the page loaded, the
+         * server refuses rather than silently overwriting the other reviewer.
+         */
+        expected: {
+          category: ticket.category,
+          severity: ticket.severity,
+          classification_source: ticket.classification_source ?? 'unclassified',
+        },
+      }),
+    onSuccess: () => {
+      setErr(null);
+      setOpen(false);
+      setSeverity('');
+      void qc.invalidateQueries({ queryKey: ['ticket', ticket.id] });
+    },
+    onError: (e: Error) => {
+      const conflict = e instanceof ApiError && e.status === 409;
+      setErr(
+        conflict
+          ? "This ticket's classification changed while you were reviewing it."
+          : e.message,
+      );
+      // On a conflict the page is stale by definition, so refetch immediately;
+      // leaving the old values on screen would invite the same failed submit.
+      if (conflict) void qc.invalidateQueries({ queryKey: ['ticket', ticket.id] });
+    },
+  });
+
+  if (!open) {
+    return (
+      <button
+        className="btn btn-ghost btn-sm"
+        style={{ marginTop: 10 }}
+        onClick={() => {
+          setCategory(ticket.category ?? '');
+          setSeverity('');
+          setErr(null);
+          setOpen(true);
+        }}
+      >
+        Correct classification
+      </button>
+    );
+  }
+
+  const unchanged = (!category || category === ticket.category) && !severity;
+
+  return (
+    <div style={{ marginTop: 12, borderTop: '1px solid var(--line)', paddingTop: 12 }}>
+      {err ? <Banner kind="err">{err}</Banner> : null}
+
+      <div className="field">
+        <label className="label">Category</label>
+        <select className="select" value={category} onChange={(e) => setCategory(e.target.value)}>
+          {/* The current value stays selectable even if the product later
+              removed it from its list, so the form can render a legacy value
+              without silently proposing to change it. */}
+          {ticket.category && !categories.some((c) => c.value === ticket.category) ? (
+            <option value={ticket.category}>{ticket.category} (not in current list)</option>
+          ) : null}
+          {categories.map((c) => (
+            <option key={c.value} value={c.value}>{c.label}</option>
+          ))}
+        </select>
+      </div>
+
+      <div className="field">
+        <label className="label">Severity</label>
+        <select className="select" value={severity} onChange={(e) => setSeverity(e.target.value)}>
+          <option value="">Let IRIS derive it from the category</option>
+          {SEVERITY_OPTIONS.map((v) => (
+            <option key={v} value={v}>{SEVERITY_LABEL[v] ?? v}</option>
+          ))}
+        </select>
+        <div className="hint">
+          Leave this on derive unless you disagree with the priority engine. Choosing a
+          severity records an explicit override.
+        </div>
+      </div>
+
+      <div className="btn-row">
+        <button className="btn" disabled={unchanged || save.isPending} onClick={() => save.mutate()}>
+          {save.isPending ? 'Saving…' : 'Save correction'}
+        </button>
+        <button className="btn btn-ghost" onClick={() => setOpen(false)}>Cancel</button>
       </div>
     </div>
   );

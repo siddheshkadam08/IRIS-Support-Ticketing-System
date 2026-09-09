@@ -16,7 +16,8 @@
         "rag",
         "embedding",
         "reranking",
-        "copilot"
+        "copilot",
+        "screenshot"
       ]
     },
     "ai_job": {
@@ -235,6 +236,9 @@
             },
             "thresholds": {
               "$ref": "#/$defs/ai_thresholds"
+            },
+            "image": {
+              "$ref": "#/$defs/ai_image_input"
             }
           }
         },
@@ -481,6 +485,9 @@
                   }
                 }
               }
+            },
+            "image": {
+              "$ref": "#/$defs/ai_image_input"
             }
           }
         }
@@ -677,6 +684,32 @@
         "received_chars": {
           "type": "integer",
           "minimum": 0
+        }
+      }
+    },
+    "ai_image_input": {
+      "type": "object",
+      "description": "Phase 19. ONE image for the `screenshot` feature. Bytes and verified type only: no attachment id, filename, blob key, ticket id, product id or uploader, so the AI service cannot attribute the image it holds to a tenant. Core authorizes the attachment and bounds its size before this field is populated.",
+      "additionalProperties": false,
+      "required": [
+        "content_type",
+        "base64"
+      ],
+      "properties": {
+        "content_type": {
+          "type": "string",
+          "enum": [
+            "image/png",
+            "image/jpeg",
+            "image/webp"
+          ],
+          "description": "Core's VERIFIED type, not the uploader's claim."
+        },
+        "base64": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8388608,
+          "description": "Standard base64, no data-URL prefix. Never logged, never persisted."
         }
       }
     }

@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 AIFeature = Literal[
     "noop", "classification", "sentiment", "keywords", "summary", "rag", "embedding",
-    "reranking", "copilot",
+    "reranking", "copilot", "screenshot",
 ]
 
 
@@ -178,6 +178,36 @@ class ExecuteInput(Strict):
     # Phase 15 Copilot only. Same bounding and identifier-free rationale.
     ticket_context: TicketContext | None = None
     copilot_evidence: list[CopilotEvidence] | None = Field(default=None, max_length=5)
+    # Phase 19 screenshot only. Exactly ONE image: a ticket with six screenshots
+    # produces six independent executions, each carrying one, so a single
+    # unreadable image cannot cost the others their analysis.
+    image: ImageInput | None = None
+
+
+class ImageInput(Strict):
+    """One image, Phase 19 screenshot only.
+
+    ⚠️ NOTE WHAT IS ABSENT AND MUST STAY ABSENT: attachment id, filename, blob
+    key, ticket id, product id, uploader. This service cannot attribute the
+    image it is holding to a tenant, so it cannot mix two of them up — the same
+    property that makes the embedding path safe.
+
+    `content_type` is Core's VERIFIED type, not the uploader's claim: Core
+    checked the magic bytes at upload and re-checked them before dispatch. It is
+    constrained here too, because this value is interpolated into the data URL
+    sent to the provider and an unconstrained string there is an injection point.
+
+    ⚠️ `base64` IS NEVER LOGGED AND NEVER PERSISTED. This service writes nothing
+    to disk and holds no database handle; the bytes exist for the duration of one
+    provider call. Every log line in the screenshot path is asserted to carry no
+    base64 by the test suite.
+    """
+
+    content_type: Literal["image/png", "image/jpeg", "image/webp"]
+    #: Standard base64, no data-URL prefix. Core bounds the decoded size at
+    #: 4 MiB before dispatch; this is the transport-side ceiling on the encoded
+    #: form, which is ~4/3 of that, rounded up to a whole number of MiB.
+    base64: str = Field(min_length=1, max_length=8 * 1024 * 1024)
 
 
 class ExecuteRequest(Strict):

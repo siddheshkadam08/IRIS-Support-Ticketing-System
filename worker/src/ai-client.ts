@@ -97,8 +97,21 @@ export async function executeAI(
      * branch made its own 5xx/4xx decision, which meant a provider 429 or 408
      * from the AI service would have been treated as permanent and
      * dead-lettered. 503 "models loading" is covered by the 5xx rule.
+     *
+     * ⚠️ THE CODE NOW COMES FROM THE AI SERVICE'S OWN ENVELOPE — finding G-3.
+     *
+     * The service already classifies precisely: `provider_content_filter`,
+     * `provider_http_429`, `provider_not_configured`, `invalid_input`,
+     * `malformed_ai_response`. All of it was being collapsed into
+     * `ai_http_422`, which is why 264 of the 282 real failures in the
+     * governance corpus said nothing more than "the AI service said no".
+     *
+     * ⚠️ TELEMETRY ONLY. The RETRY CLASS is still `errorForStatus(res.status,
+     * …)` — decided by the HTTP status, exactly as before. A richer code
+     * cannot change whether BullMQ retries, and BullMQ remains the sole retry
+     * owner. Only the label travelling to `ai_execution.error_code` improves.
      */
-    throw errorForStatus(res.status, `ai_http_${res.status}`, text);
+    throw errorForStatus(res.status, providerCodeOf(text, res.status), text);
   }
 
   let body: unknown;
@@ -126,4 +139,35 @@ export async function executeAI(
     );
   }
   return parseAIResult(body);
+}
+
+/**
+ * The AI service's own failure code, or a status-derived fallback.
+ *
+ * The service answers a failure with `{"error":{"kind","code","message"}}` —
+ * `provider_content_filter`, `provider_http_429`, `provider_not_configured`,
+ * `invalid_input`, `malformed_ai_response` and so on. That code is the most
+ * specific thing anyone knows about the failure, and it was being thrown away
+ * in favour of the HTTP status.
+ *
+ * ⚠️ NEVER THROWS, and never blocks the failure path. A body that is missing,
+ * truncated, not JSON, or not the expected shape yields `ai_http_<status>` —
+ * byte-identical to the old behaviour, so nothing that already depends on those
+ * codes breaks.
+ *
+ * ⚠️ BOUNDED AND CHARACTER-RESTRICTED. The code becomes durable telemetry in
+ * `ai_execution.error_code`, so a provider that echoes prompt fragments into a
+ * `code` field cannot turn it into a content leak: anything that is not a short
+ * machine token is rejected in favour of the fallback.
+ */
+export function providerCodeOf(body: string, status: number): string {
+  const fallback = `ai_http_${status}`;
+  try {
+    const parsed = JSON.parse(body) as { error?: { code?: unknown } };
+    const code = parsed?.error?.code;
+    // Machine tokens only: lower-case, digits, underscore, 1..64 chars.
+    return typeof code === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : fallback;
+  } catch {
+    return fallback;
+  }
 }

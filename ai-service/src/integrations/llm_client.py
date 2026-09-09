@@ -61,6 +61,18 @@ class LLMPermanentError(RuntimeError):
         self.code = code
 
 
+class ImageContent(Protocol):
+    """Just enough of an image to build a data URL.
+
+    A Protocol rather than an import of `src.api.schemas.ImageInput`: this
+    module is the provider transport and must not depend on the API layer's
+    models, which is the same reason `ChatCompletions` is one.
+    """
+
+    content_type: str
+    base64: str
+
+
 @dataclass
 class StructuredResult:
     """A validated model instance plus what it cost to get one."""
@@ -117,6 +129,7 @@ class OpenRouterClient:
         user_prompt: str,
         response_model: type[BaseModel],
         request_id: str,
+        image: ImageContent | None = None,
     ) -> StructuredResult:
         """One classification. At most two provider calls, one shared budget."""
         started = time.monotonic()
@@ -125,9 +138,42 @@ class OpenRouterClient:
         def remaining() -> float:
             return deadline - time.monotonic()
 
+        # ── The user turn: a plain string, or content blocks when an image
+        # is present — Phase 19.
+        #
+        # ⚠️ TEXT-ONLY KEEPS THE EXACT SHAPE IT ALWAYS HAD. `content` stays a
+        # STRING for every existing feature rather than becoming a one-element
+        # block list "for consistency". Classification, summary, RAG, reranking
+        # and copilot all go through this method, and changing the wire shape of
+        # their request to accommodate a feature none of them use would put five
+        # working prompts at risk for a tidiness argument.
+        #
+        # The multimodal branch is the provider's standard content-block form:
+        # the text first so the instruction is read before the image, then the
+        # image as a data URL built from Core-verified values.
+        user_content: Any = user_prompt
+        if image is not None:
+            user_content = [
+                {"type": "text", "text": user_prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        # `content_type` is a Literal on the Pydantic model and
+                        # the base64 is produced by Core, so neither is free
+                        # text being interpolated into a URL.
+                        "url": f"data:{image.content_type};base64,{image.base64}",
+                        # 'high' would tile the image into many more patches for
+                        # a large multiple of the tokens. A support screenshot's
+                        # error text is legible at 'auto', and the cost
+                        # difference is the whole per-call budget.
+                        "detail": "auto",
+                    },
+                },
+            ]
+
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_content},
         ]
 
         # Strict structured outputs need every property in `required` and
@@ -214,6 +260,10 @@ class OpenRouterClient:
                     from src.api.prompts import REPAIR_INSTRUCTION
 
                     messages.append({"role": "assistant", "content": raw})
+                    # Text-only, deliberately: the image is already in the
+                    # conversation history above, and re-sending it would bill a
+                    # second image for a request that is only asking the model to
+                    # fix its own JSON.
                     messages.append(
                         {"role": "user", "content": REPAIR_INSTRUCTION.format(error=str(exc)[:300])}
                     )

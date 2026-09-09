@@ -31,6 +31,12 @@ from .summary import build_user_prompt as build_summary_user_prompt
 from .embedding import run_embedding
 from .copilot import run_copilot
 from .rag import run_rag
+from .screenshot import (
+    SCREENSHOT_PROMPT_VERSION,
+    SCREENSHOT_SYSTEM_PROMPT,
+    ScreenshotOutput,
+    build_screenshot_user_prompt,
+)
 from .reranking import run_reranking
 from .schemas import AIResult, ExecuteRequest
 
@@ -195,7 +201,7 @@ async def run_classification(req: ExecuteRequest) -> AIResult:
         confidence=None,
         provider=config.classification_provider,
         model=config.classification_model_id,
-        model_version=None,
+        model_version=config.classification_model_version,
         prompt_version=PROMPT_VERSION,
         latency_ms=int((time.perf_counter() - started) * 1000),
         fallback_used=result.used_repair,
@@ -264,8 +270,88 @@ async def run_summary(req: ExecuteRequest) -> AIResult:
         confidence=None,
         provider=config.classification_provider,
         model=config.classification_model_id,
-        model_version=None,
+        model_version=config.classification_model_version,
         prompt_version=SUMMARY_PROMPT_VERSION,
+        latency_ms=int((time.perf_counter() - started) * 1000),
+        fallback_used=result.used_repair,
+    )
+
+
+
+
+async def run_screenshot(req: ExecuteRequest) -> AIResult:
+    """Interpret ONE screenshot attached to a ticket.
+
+    ⚠️ EVIDENCE, NOT A DECISION. The output carries observations, a hint,
+    possible causes and suggested steps, and no priority, severity, routing or
+    reply — `ScreenshotOutput` has no field for them.
+
+    Shares the provider client, the single wall-clock budget and the one bounded
+    repair round with every other feature. Nothing here is screenshot-specific
+    except the prompt, the schema and the image block: a second timeout or a
+    retry of its own would be a second retry owner, and BullMQ is the only one.
+    """
+    started = time.perf_counter()
+
+    image = req.input.image
+    if image is None:
+        # Permanent: Core promised an image and did not send one, and the same
+        # request will be missing it on every retry.
+        raise FeatureError("invalid_input", "screenshot requires an image", "permanent")
+
+    if not config.classification_enabled:
+        # Honest unavailability rather than a fabricated interpretation.
+        # Temporary, so the job survives until a credential is configured.
+        raise FeatureError(
+            "provider_not_configured",
+            "no AI provider credential is configured",
+            "temporary",
+        )
+
+    from ..integrations.llm_client import (
+        LLMPermanentError,
+        LLMTemporaryError,
+        OpenRouterClient,
+    )
+
+    client = OpenRouterClient(
+        completions=_completions(),
+        model=config.classification_model,
+        budget_seconds=config.classification_budget_seconds,
+    )
+
+    try:
+        result = await client.generate_structured(
+            system_prompt=SCREENSHOT_SYSTEM_PROMPT,
+            user_prompt=build_screenshot_user_prompt(
+                subject=req.input.subject, description=req.input.description
+            ),
+            response_model=ScreenshotOutput,
+            request_id=req.request_id,
+            # THE ONLY PLACE AN IMAGE ENTERS A PROVIDER CALL.
+            image=image,
+        )
+    except LLMTemporaryError as exc:
+        raise FeatureError(exc.code, str(exc), "temporary") from exc
+    except LLMPermanentError as exc:
+        raise FeatureError(exc.code, str(exc), "permanent") from exc
+
+    value = result.value.model_dump()
+
+    return AIResult(
+        feature="screenshot",
+        status="succeeded",
+        # Core validates and bounds this before anything is persisted; this
+        # service returning it is not the same as Core accepting it.
+        data=value,
+        # ⚠️ THE MODEL'S OWN REPORTED SIGNAL, surfaced through the `confidence`
+        # column the execution ledger already has. It is not a calibrated
+        # probability and nothing downstream may present it as one.
+        confidence=value.get("confidence"),
+        provider=config.classification_provider,
+        model=config.classification_model_id,
+        model_version=config.classification_model_version,
+        prompt_version=SCREENSHOT_PROMPT_VERSION,
         latency_ms=int((time.perf_counter() - started) * 1000),
         fallback_used=result.used_repair,
     )
@@ -358,6 +444,10 @@ FEATURES: dict[str, Callable[[ExecuteRequest], Any]] = {
     # set and cites source NUMBERS, so it cannot name a document Core did not
     # supply.
     "rag": run_rag,
+    # Phase 19. Interprets ONE already-authorized image and returns structured
+    # evidence. It has no field in which to express a priority, severity,
+    # assignment or status, so it cannot make a ticket decision.
+    "screenshot": run_screenshot,
     # Phase 15. Drafts a customer reply for a human to review, edit and send.
     # It returns TEXT — this service cannot send anything to anyone.
     "copilot": run_copilot,

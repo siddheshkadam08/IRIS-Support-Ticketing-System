@@ -210,7 +210,11 @@ describe('the queue boundary', () => {
 
   it('KEEPS rag off the ai.jobs queue', () => {
     expect(SUPPORTED_AI_FEATURES).not.toContain('rag');
-    expect(SUPPORTED_AI_FEATURES).toEqual(['noop', 'classification', 'summary']);
+    // The exact-set guard lives in shared/contracts/ai-contracts.test.ts, which
+    // owns the whole queue surface. Repeating it here made every unrelated
+    // feature test fail when Phase 19 added `screenshot` — a real queue
+    // feature — while saying nothing about rag. The property THIS test is
+    // named for is the line above, and it is unchanged.
   });
 });
 

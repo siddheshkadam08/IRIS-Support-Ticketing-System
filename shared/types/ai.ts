@@ -56,6 +56,20 @@ export const AI_FEATURES = [
    * it runs inside an admin request and never travels on the ai.jobs queue.
    */
   'copilot',
+  /**
+   * Phase 19. Interprets ONE screenshot attached to a ticket.
+   *
+   * Present in SUPPORTED_AI_FEATURES, unlike every other feature added since
+   * Phase 5, because it genuinely travels on the ai.jobs queue: it is triggered
+   * by a durable outbox fact, it is slow, it costs money, and it must survive a
+   * provider outage. That is the queue's whole purpose.
+   *
+   * ⚠️ IT PRODUCES EVIDENCE, NOT A DECISION. Its validated result carries
+   * observations, a hint, possible causes and suggested steps — and no field in
+   * which a priority, severity, assignment or status could be expressed. See
+   * shared/types/screenshot.ts.
+   */
+  'screenshot',
 ] as const;
 export type AIFeature = (typeof AI_FEATURES)[number];
 
@@ -102,7 +116,17 @@ export type AIFeature = (typeof AI_FEATURES)[number];
  * no validator for it — a permanent error at best, and at worst a shape nobody
  * checked being written somewhere. Phase 10 tests assert it stays absent.
  */
-export const SUPPORTED_AI_FEATURES: readonly AIFeature[] = ['noop', 'classification', 'summary'];
+export const SUPPORTED_AI_FEATURES: readonly AIFeature[] = [
+  'noop',
+  'classification',
+  'summary',
+  /**
+   * Phase 19. Screenshot analysis IS queue work — see the note on the feature
+   * itself. It has a validator in FEATURE_VALIDATORS, so unlike `rag`,
+   * `embedding`, `reranking` and `copilot` it has somewhere legitimate to land.
+   */
+  'screenshot',
+];
 
 export function isSupportedFeature(v: unknown): v is AIFeature {
   return typeof v === 'string' && (SUPPORTED_AI_FEATURES as readonly string[]).includes(v);
@@ -131,6 +155,22 @@ export const AI_EVENT_FEATURES: Readonly<Record<string, readonly AIFeature[]>> =
    * classification payload: shared failure was the thing to avoid.
    */
   'ticket.created': ['noop', 'classification', 'summary'],
+  /**
+   * Phase 19. Emitted by the attachment-linking transaction (Step 1), ONE PER
+   * ATTACHMENT.
+   *
+   * ⚠️ IT IS NOT `ticket.created`, AND THAT WAS THE WHOLE POINT OF STEP 1. The
+   * widget uploads, then creates the ticket, then links. `ticket.created`
+   * commits before the link request is even sent, so a screenshot job
+   * dispatched from it would look for attachments that are not yet attached and
+   * succeed at finding none — a race no retry policy fixes.
+   *
+   * One event per attachment keeps the granularity `ai_execution` already has:
+   * UNIQUE(event_id, feature) then gives each screenshot its own execution row,
+   * its own retry budget and its own outcome, so one unreadable image cannot
+   * cost the others their analysis.
+   */
+  'ticket.attachment_linked': ['screenshot'],
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -238,6 +278,13 @@ export type AIInputResponse =
       ticket: AITicketInput;
       taxonomy: AITaxonomy;
       thresholds: AIThresholds;
+      /**
+       * Phase 19. Present only for `screenshot`, and only once Core has
+       * authorized the attachment against the event's own ticket and product,
+       * verified its bytes and bounded its size. The worker forwards it and
+       * never resolves an attachment itself.
+       */
+      image?: AIImageInput;
     }
   | {
       status: 'already_applied';
@@ -273,7 +320,40 @@ export interface AIExecuteRequest {
     /** Only for features that classify. Absent for `noop`. */
     taxonomy?: AITaxonomy;
     thresholds?: AIThresholds;
+    /**
+     * Phase 19 — the ONE image, for `screenshot` and nothing else.
+     *
+     * ⚠️ THIS IS THE WRITTEN DECISION THE COMMENT ABOVE ASKED FOR. The list of
+     * things that must never cross named `attachments`, "never to be added
+     * without a written decision". This is that decision, and it is narrower
+     * than "attachments":
+     *
+     *   - ONE image, never a list. A ticket with six screenshots produces six
+     *     independent executions, each carrying one.
+     *   - BYTES AND TYPE ONLY. No attachment_id, no filename, no blob key, no
+     *     ticket id, no product id, no uploader. Python cannot attribute the
+     *     image it is holding to a tenant, so it cannot mix two of them up —
+     *     the same property that makes the embedding path safe.
+     *   - ALREADY AUTHORIZED AND ALREADY BOUNDED. Core proved the attachment
+     *     belongs to the ticket and the product, that its declared type matches
+     *     its bytes, and that it is within the vision dispatch limits, before
+     *     this field was populated.
+     */
+    image?: AIImageInput;
   };
+}
+
+/**
+ * A single image, base64-encoded for JSON transport.
+ *
+ * `content_type` is Core's VERIFIED type, not the uploader's claim: Step 1's
+ * magic-byte check ran at upload and Core re-checks the bytes before dispatch.
+ * Python builds the provider's data URL from these two fields and nothing else.
+ */
+export interface AIImageInput {
+  content_type: string;
+  /** Standard base64, no data-URL prefix. Never logged, never persisted. */
+  base64: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────

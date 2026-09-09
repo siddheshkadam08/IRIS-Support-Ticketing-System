@@ -109,11 +109,43 @@ export async function handleAIJob(
     input: {
       subject: input.ticket.subject,
       description: input.ticket.description,
-      ...(input.feature === 'noop'
-        ? {}
-        : { taxonomy: input.taxonomy, thresholds: input.thresholds }),
+      /**
+       * Phase 19. `screenshot` gets the image and NEITHER taxonomy NOR
+       * thresholds.
+       *
+       * It classifies nothing, so a vocabulary would be data it cannot use —
+       * and sending data a feature cannot use is exactly how a boundary erodes.
+       * The subject and description stay: a screenshot read without knowing what
+       * the customer said about it is a caption exercise, and the ticket text
+       * already crosses for every other feature.
+       *
+       * ⚠️ THE WORKER DOES NOT RESOLVE THE IMAGE. It forwards what Core
+       * returned, having never seen an attachment id — `AIJob` has no field for
+       * one. The worker is a courier here exactly as it is on the embedding
+       * path.
+       */
+      ...(input.feature === 'screenshot'
+        ? input.image
+          ? { image: input.image }
+          : {}
+        : input.feature === 'noop'
+          ? {}
+          : { taxonomy: input.taxonomy, thresholds: input.thresholds }),
     },
   };
+
+  /**
+   * Core promised an image for a screenshot job and did not deliver one. That
+   * is a Core-side contract break rather than a provider problem, and calling
+   * the model with no image would produce a confident interpretation of
+   * nothing. Permanent: the same request returns the same missing field.
+   */
+  if (input.feature === 'screenshot' && !executeRequest.input.image) {
+    throw new PermanentJobError(
+      'invalid_input',
+      'screenshot job received no image from Core',
+    );
+  }
 
   const result = await executeAI(executeRequest, opts.aiFetch);
 

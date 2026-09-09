@@ -252,6 +252,30 @@ class Config:
             return f"azure/{self.azure_deployment}"
         return self.classification_model
 
+    @property
+    def classification_model_version(self) -> str | None:
+        """What to record as `model_version` on the execution.
+
+        Pre-Phase-17 hardening, finding G-7: this was None for every real
+        execution, so 3,888 Azure rows carried no version information at all.
+
+        For Azure it is the API VERSION the call was made against
+        (`2024-12-01-preview`). That is a real, observable version that governs
+        request and response behaviour, and a change to it is a change that can
+        move quality.
+
+        WHAT IT IS NOT: the model weights version. Azure does not expose that
+        through the API, and guessing at it would be exactly the fabrication the
+        governance audit forbids. `model` already records the deployment, which
+        is what actually determines the model served.
+
+        OpenRouter model ids already carry their own version (e.g.
+        `google/gemma-3-27b-it`), so there is nothing separate to record.
+        """
+        if self.classification_provider == "azure":
+            return self.azure_api_version
+        return None
+
         # A secret committed to the repository is not a secret. Refuse to boot
         # in production on the placeholder or on something brute-forceable.
         if env.get("NODE_ENV") == "production":

@@ -244,8 +244,20 @@ async function main() {
         audits.every(
           (a) =>
             Object.keys(a.after ?? {}).sort().join(',') ===
-            'citations,draft_chars,historical_evidence,kb_evidence,model,outcome,prompt_version',
+            'citations,draft_chars,generation_ms,historical_evidence,kb_evidence,model,outcome,prompt_version,retrieval_ms,total_ms',
         ),
+      JSON.stringify(audits[0]?.after),
+    );
+    /**
+     * ⚠️ Latency is metadata; the DRAFT is not. Copilot writes no
+     * `ai_execution` row — it is synchronous and has no outbox event — so this
+     * audit entry is the only durable record that it ran, and without timings
+     * governance could report latency for every feature except the one a human
+     * waits on. Added pre-Phase-17.
+     */
+    check(
+      'the audit carries timings, and still no draft text',
+      audits.every((a) => typeof a.after?.total_ms === 'number' && a.after.total_ms >= 0),
       JSON.stringify(audits[0]?.after),
     );
     check('no comment audit event was written', (await auditFor(t2.id, 'ticket.comment_added')).length === 0);

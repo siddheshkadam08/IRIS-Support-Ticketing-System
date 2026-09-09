@@ -10,6 +10,7 @@ import {
 } from '@iris/shared/types';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
+import { isEligibleScreenshotPayload } from '../internal/screenshot.input.js';
 import { withSystemScope, type Tx } from '../db/with-scope.js';
 
 /**
@@ -163,13 +164,56 @@ async function drain(from: Date): Promise<void> {
 function featuresFor(row: AIOutboxRow): readonly AIFeature[] {
   const declared = (AI_EVENT_FEATURES[row.event_type] ?? []) as readonly AIFeature[];
   const requested = row.payload?.ai_features;
-  if (!Array.isArray(requested)) return declared;
-  return declared.filter((f) => requested.includes(f));
+  const narrowed = Array.isArray(requested)
+    ? declared.filter((f) => requested.includes(f))
+    : declared;
+
+  /**
+   * Phase 19. A second NARROWING, on the same principle.
+   *
+   * `ticket.attachment_linked` fires for EVERY attachment, and most attachments
+   * are not screenshots — a CSV, a log file, a PDF. Dispatching a screenshot
+   * job for those would create an `ai_execution` row whose only possible
+   * outcome is `unsupported_media_type`, so the operational failure list would
+   * fill with rows that mean "someone attached a spreadsheet". A failure list
+   * nobody can skim is a failure list nobody reads.
+   *
+   * ⚠️ IT CAN ONLY REMOVE, NEVER ADD, which is what keeps a payload from
+   * becoming an instruction. The eligibility read here is a HINT taken from
+   * data; Core re-checks the attachment ROW authoritatively in
+   * `resolveScreenshotImage` before any byte is dispatched, and that check is
+   * the enforcement.
+   */
+  return narrowed.filter(
+    (f) => f !== 'screenshot' || isEligibleScreenshotPayload(row.payload ?? {}),
+  );
 }
 
 async function dispatch(q: Queue<AIJob>, row: AIOutboxRow): Promise<void> {
   const features = featuresFor(row);
-  if (features.length === 0) return;
+
+  /**
+   * ⚠️ NOTHING TO DISPATCH IS A FINISHED ROW, NOT A PENDING ONE.
+   *
+   * This previously returned without stamping `published_at`, so a row with no
+   * features would be re-read on every tick forever. That was unreachable while
+   * every mapped event type produced at least one feature — Phase 19 makes it
+   * reachable, because a linked CSV maps to zero.
+   *
+   * The same latent case existed for a replay naming a feature the event type
+   * does not declare; that is fixed here too. Marking it published says what is
+   * true: this row has been considered and there is no work in it.
+   */
+  if (features.length === 0) {
+    await sys((tx) =>
+      tx.query(`UPDATE event_outbox SET published_at = now() WHERE id = $1`, [row.id]),
+    );
+    logger.info(
+      { eventId: row.event_id, eventType: row.event_type },
+      'no AI features apply to this event — marked published without dispatch',
+    );
+    return;
+  }
 
   try {
     for (const feature of features) {

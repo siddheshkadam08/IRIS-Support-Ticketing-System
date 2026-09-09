@@ -66,6 +66,7 @@ def test_ready_reports_loaded_features(client):
     assert res.status_code == 200
     body = res.json()
     assert body["status"] == "ready"
+    # Sorted; Phase 19 inserts `screenshot` between `reranking` and `summary`.
     assert body["features"] == [
         "classification",
         "copilot",
@@ -73,6 +74,7 @@ def test_ready_reports_loaded_features(client):
         "noop",
         "rag",
         "reranking",
+        "screenshot",
         "summary",
     ], (
         "readiness must report exactly what is built — the stub since Phase 1, "

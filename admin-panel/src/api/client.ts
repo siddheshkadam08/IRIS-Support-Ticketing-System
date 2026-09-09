@@ -7,8 +7,51 @@
  */
 
 import type { WidgetSettings } from '@iris/shared/widget-config';
+import type { GovernanceResponse } from '@iris/shared/types';
+/**
+ * Phase 18 — the KB lifecycle contract.
+ *
+ * ⚠️ IMPORTED FROM THE `@iris/shared/kb` SUBPATH, NOT FROM `@iris/shared/types`.
+ *
+ * This is the first shared import the panel needs at RUNTIME rather than as a
+ * type: the transition matrix and the role rules are values, and they decide
+ * which controls render. The `types` barrel re-exports ids.ts, which imports
+ * `node:crypto` — harmless while every import from it is erased at build time,
+ * and a broken bundle the moment one is not. The subpath reaches the module
+ * directly and it has no imports at all.
+ */
+import type { KbArticleAdminDTO, KbArticleListResponse, KbArticleStatus } from '@iris/shared/kb';
+/** Phase 19 — screenshot evidence. Subpath import, same reason as the KB one. */
+import type { ScreenshotResultDTO } from '@iris/shared/screenshot';
 
 export type { WidgetSettings, WidgetCapability, WidgetCategory } from '@iris/shared/widget-config';
+
+/**
+ * Phase 17 — AI governance.
+ *
+ * The response shape is owned by shared types, not restated here: a second copy
+ * would drift, and the panel would then be rendering a contract the server no
+ * longer serves.
+ */
+export type { GovernanceResponse } from '@iris/shared/types';
+
+/**
+ * Phase 18 — KB authoring. Re-exported so pages import the wire shapes from
+ * here like every other type, while the definition stays in shared and cannot
+ * drift from what the server serves.
+ */
+export type {
+  ScreenshotInterpretation,
+  ScreenshotObservation,
+  ScreenshotResultDTO,
+} from '@iris/shared/screenshot';
+
+export type {
+  KbArticleAdminDTO,
+  KbArticleListResponse,
+  KbArticleStatus,
+  KbIndexState,
+} from '@iris/shared/kb';
 
 export class ApiError extends Error {
   constructor(
@@ -170,7 +213,17 @@ export interface TicketDetail extends TicketRow {
     is_internal: boolean;
     created_at: string;
   }>;
-  attachments: Array<{ id: string; filename: string; size_bytes: number; created_at: string }>;
+  /**
+   * `content_type` is what listAttachments() has always returned; the type here
+   * simply never named it, so the panel could not tell an image from a ZIP.
+   */
+  attachments: Array<{
+    id: string;
+    filename: string;
+    content_type: string;
+    size_bytes: number;
+    created_at: string;
+  }>;
   grants: Grant[];
   deliveries: Delivery[];
   history: Array<{
@@ -189,6 +242,12 @@ export interface TicketDetail extends TicketRow {
    */
   classification_source?: 'product' | 'ai_auto' | 'ai_uncertain' | 'unclassified';
   ai_classification?: unknown;
+  /**
+   * Phase 19. One entry per screenshot the AI pipeline has processed for this
+   * ticket. Evidence only: there is no field here through which it could carry
+   * a priority, severity, assignment or status.
+   */
+  screenshot_ai?: ScreenshotResultDTO[];
 }
 
 export interface AdminUser {
@@ -385,6 +444,37 @@ export const api = {
   comment: (id: string, body: string, is_internal: boolean) =>
     request<{ id: string }>('POST', `/admin/api/tickets/${id}/comments`, { body, is_internal }),
 
+  /**
+   * Phase 19 Step 1 — attachment content, for the agent viewing a ticket.
+   *
+   * ⚠️ RETURNS A BLOB, NOT JSON, so it deliberately does not go through
+   * `request()`. The server replies `application/octet-stream` with
+   * `Content-Disposition: attachment` and a sandbox CSP, which is what keeps an
+   * uploaded file from ever being rendered inline in an authenticated staff
+   * session. The caller decides what to do with the bytes; for images the
+   * ticket page builds a blob URL under a type from its OWN fixed allowlist,
+   * never from a string the upload supplied.
+   */
+  attachmentBlob: async (ticketId: string, attachmentId: string): Promise<Blob> => {
+    const res = await fetch(
+      `${BASE}/admin/api/tickets/${ticketId}/attachments/${attachmentId}/content`,
+      { credentials: 'include' },
+    );
+    if (!res.ok) {
+      let code = 'internal_error';
+      let message = `Request failed (${res.status})`;
+      try {
+        const payload = await res.json();
+        code = payload?.error?.code ?? code;
+        message = payload?.error?.message ?? message;
+      } catch {
+        /* the error body was not JSON */
+      }
+      throw new ApiError(code, message, res.status);
+    }
+    return res.blob();
+  },
+
   users: () => request<{ data: AdminUser[] }>('GET', '/admin/api/users'),
   createUser: (payload: Record<string, unknown>) => request<{ id: string }>('POST', '/admin/api/users', payload),
   updateUser: (id: string, payload: Record<string, unknown>) =>
@@ -407,4 +497,29 @@ export const api = {
 
   audit: (qs: string) =>
     request<{ data: Array<Record<string, unknown>> }>('GET', `/admin/api/audit${qs ? `?${qs}` : ''}`),
+
+  /**
+   * Phase 17 — aggregate AI governance figures. Read-only: it writes nothing,
+   * and every number it returns names the population it was computed over.
+   */
+  aiGovernance: (qs: string) =>
+    request<GovernanceResponse>('GET', `/admin/api/ai/governance${qs ? `?${qs}` : ''}`),
+
+  /**
+   * Phase 18 — knowledge base authoring.
+   *
+   * ⚠️ THERE IS NO publish/unpublish/archive METHOD, deliberately. All four are
+   * `kbSetStatus`, because the server has one transition endpoint consulting one
+   * matrix. Four client methods would invite four call sites that each decide
+   * for themselves whether a transition is allowed.
+   */
+  kbArticles: (qs: string) =>
+    request<KbArticleListResponse>('GET', `/admin/api/kb/articles${qs ? `?${qs}` : ''}`),
+  kbArticle: (id: string) => request<KbArticleAdminDTO>('GET', `/admin/api/kb/articles/${id}`),
+  kbCreate: (payload: { product_id: string; title: string; body: string; category?: string | null }) =>
+    request<KbArticleAdminDTO>('POST', '/admin/api/kb/articles', payload),
+  kbUpdate: (id: string, payload: { title?: string; body?: string; category?: string | null }) =>
+    request<KbArticleAdminDTO>('PATCH', `/admin/api/kb/articles/${id}`, payload),
+  kbSetStatus: (id: string, status: KbArticleStatus) =>
+    request<KbArticleAdminDTO>('PATCH', `/admin/api/kb/articles/${id}/status`, { status }),
 };

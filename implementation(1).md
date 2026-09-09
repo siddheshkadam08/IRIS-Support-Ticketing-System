@@ -6483,6 +6483,164 @@ calls per draft · no fabricated history or evaluation data · analytics deferre
 
 ---
 
+# 44J. Phase 17 — AI Governance & Analytics
+
+One read-only aggregate endpoint, one admin page, seven columns added to an
+existing projection. **Zero tables, zero indexes, zero migrations, zero
+infrastructure.** Phase 17 is a read model over data three earlier phases
+already record.
+
+## 44J.1 ⚠️ The rule the whole phase is built on
+
+> **A metric is a formula PLUS a population.**
+
+The design review found the first draft using "governance corpus" for two
+different sets — what is *measurable*, and what the headline numbers are
+actually *computed over* — and only one metric in fifteen mentioning that
+replays were excluded. Written the obvious way, with a `WHERE` clause per
+metric, that defect is invisible: every number looks right on its own and only
+the arithmetic *between* them is wrong.
+
+So the population is declared exactly once, as a CTE chain in
+`governance.repo.ts`, and every metric is a `SELECT` over one of its layers. A
+metric cannot read `ai_execution` directly because the query text it lives in
+mentions that table exactly once, inside L1.
+
+```
+scoped_executions    L1   window + RLS + caller filters
+governance_corpus    L2   L1 AND the approved corpus rule
+flagged              L2   + is_replay / enqueued_at, from a LEFT JOIN
+headline_population  L3   L2 AND NOT replay   ← every headline metric
+replay_population    L3'  L2 AND replay
+```
+
+Two identities, computed on every request and returned as
+`population.identity_holds`:
+
+```
+L1 = L2 + excluded_by_corpus_rule
+L2 = L3 + L3'
+```
+
+## 44J.2 ⚠️ The LEFT JOIN, and the rows it saves
+
+Replay identification reads `event_outbox`. The first design said "join the
+outbox"; verifying an unrelated claim during the design revision turned up this:
+
+```
+corpus executions with no matching event_outbox row:  4
+all executions with no matching event_outbox row:  1,870
+```
+
+An `INNER JOIN` would have removed those four rows from **every headline
+figure** — no error, no warning, just numbers permanently a little too small. A
+missing outbox row means *not a replay*, never *not counted*. `queue_delay` is
+the only metric allowed to drop them, and it publishes the smaller `n`.
+
+Live proof, from the running system: `headline = 4,918`, `queue_delay n = 4,914`,
+orphan rows = 4. The difference is exactly the orphan count.
+
+## 44J.3 ⚠️ The vocabulary rule that had to be rewritten
+
+The first rule was "these terms must not appear on the page". It contradicted
+its own required copy on the first line: the confidence disclaimer contains
+*correct*, and the sentence denying an accuracy metric contains *accuracy*. A
+blanket scan fails on exactly the sentences that make the page honest — and the
+easiest way to make such a test pass is to delete them.
+
+The rule now targets **use**, not characters:
+
+| | |
+|---|---|
+| **Prohibited** | a term that ASSERTS a property, used as an API key, enum value, metric name, heading, KPI label, column header or chart title |
+| **Required** | the same term inside an element marked `data-governance-disclaimer`, where it DENIES that property |
+
+The same confusion reappeared one level down, in implementation: `uncalibrated`
+— the honest label for the confidence signal — contains `calibrated`. A
+substring match flagged it, and the only ways to pass would have been to delete
+the honest label or to exempt the term entirely. `assertsProhibitedClaim` now
+requires the term to *begin a word* (`(?<![A-Za-z])`), so `uncalibrated` and
+`inaccurate` are denials while `calibrated_confidence` and `quality_score_v2`
+remain claims.
+
+## 44J.4 The withdrawn explanation
+
+An earlier draft explained `attempt > 6` as "consistent with replay re-claims".
+**That was unsupported and is withdrawn.** Verified: all 58 such rows are
+`feature = 'noop'`; **none are inside the governance corpus**; the five at
+`attempt = 9` are explicitly not replays, and the 53 at `attempt = 7` have no
+outbox row at all. The cause is not established, and nothing in Phase 17 claims
+one. M7 reports the distribution and says only that per-attempt reasons are not
+recoverable — one row per execution, updated in place, so only the terminal
+reason survives.
+
+## 44J.5 Files
+
+| File | Change |
+|---|---|
+| `shared/types/ai-governance.ts` | +population layers, failure map, bucket helpers, disclaimers, prohibited-claim policy, response DTOs |
+| `core-service/src/admin/governance.repo.ts` | **new** — the canonical CTE chain and all fifteen metrics, one round trip |
+| `core-service/src/admin/governance.service.ts` | **new** — window/feature validation, suppression, caveat generation, assembly |
+| `core-service/src/admin/ai-ops.routes.ts` | `GET /admin/api/ai/governance`; `VIEW_COLUMNS` widened by seven provenance columns |
+| `admin-panel/src/api/client.ts` | `aiGovernance()`, DTO re-export |
+| `admin-panel/src/pages/AIGovernance.tsx` | **new** — eleven sections, population arithmetic first |
+| `admin-panel/src/App.tsx` | route + nav, hidden from `agent` |
+
+Tests: `governance.test.ts` (45), `governance.window.test.ts` (13),
+`ai-governance-read-model.test.ts` (32), `ai-governance-vocabulary.test.ts` (16).
+
+## 44J.6 Metrics, and what each one refuses to say
+
+All fifteen carry their own `n` and name their population in the response.
+
+| Metric | Population | Refuses to say |
+|---|---|---|
+| M1 executions | `headline` | that executions are tickets — one ticket yields two |
+| M2 status counts | `headline` | that succeeded means correct |
+| M3 success rate | `headline` + completed | anything at all below n=30; returns `null`, never `0%` |
+| M4 provider latency | `headline+succeeded+latency` | that this is what a person waits for |
+| M5 wall clock | `headline+completed` | that it is comparable with M4 — it includes backoff and reaper closure |
+| M6 queue delay | `headline+enqueued` | that its denominator equals L3 |
+| M7 attempts | `headline` | why any individual attempt failed |
+| M8 failures | `headline+failed` | what an unrecognised code meant — it stays `unclassified` with its raw value |
+| M9 confidence | `headline+confidence` | that it is a probability of correctness |
+| M10 routing | `headline+classification+decision` | that the model chose — IRIS did, from thresholds |
+| M11 provenance | `headline` | a version it never observed; renders "not recorded" |
+| M12 population | L1→L3′→L3 | — this *is* the honesty panel |
+| M13 Copilot | `audit_event` | what the agent did with the draft |
+| M14 replays | `replay` | — reported precisely so they leave the headline |
+| M15 fallback | `headline` | a percentage; one occurrence is a count |
+
+## 44J.7 Verified on the running system
+
+19 checks through the **running gateway** with real login sessions, all passing:
+roles 200/403/401 · super-admin platform view non-empty · cross-product
+isolation with positive controls on both tenants · out-of-scope product → 404,
+identical to non-existent · identity holds on live data · orphan rows retained ·
+no sensitive field and no real ticket text · confidence only where defined ·
+no prohibited claim in any key or enum · Copilot separate · `feature=noop` → 400
+· **no writes**, with a positive control proving the detector is not blind
+(logins *did* move the digest).
+
+Performance: `Execution Time 108 ms`, endpoint **p50 97 ms, p95 111 ms** over
+14,068 rows — against a 500 ms budget. The plan is a single `Seq Scan` on
+`ai_execution` feeding memoised index lookups on `event_outbox_event_id_key`.
+The proposed governance index was **not** created: it would cost write
+amplification on the platform's highest-write AI table to save ~90 ms.
+
+## 44J.8 Accepted limitations
+
+Stated on the page, not hidden: no accuracy, precision or calibration — IRIS
+holds no ground truth · no cost or token data — never captured, must not be
+estimated · no classification-correction rate — no endpoint changes a category ·
+no Copilot edit/send linkage — drafts are ephemeral by design · no
+Suggested-Assignee acceptance — nothing records what was suggested · per-attempt
+failure reasons unavailable · Copilot timings exist for 11 of 474 invocations,
+the rest predating instrumentation · 264 of 282 corpus failures are the historic
+`ai_http_422` and land in `unclassified` with the raw code visible.
+
+---
+
 # 45. Future Implementation Checklist
 
 
@@ -6786,4 +6944,39 @@ Not done  Core outage during reporting, worker crash mid-report, and
           stall-induced failures (which never emit 'failed') remain Step 5.
           The Step 5 reaper threshold must be recomputed from the 751s window.
 Phase     Phase 3 Step 4 - COMPLETE. Next: Step 5 (reaper).
+```
+
+---
+
+## Change log — Phase 17
+
+```text
+Date      2026-09-09
+Change    AI Governance & Analytics. One read-only aggregate endpoint
+          (GET /admin/api/ai/governance), one admin page (/ai-governance), and
+          seven provenance columns added to the existing executions projection.
+Reason    Fifteen operational metrics existed only as rows nobody could read.
+          The governance question is not "how is the AI doing" but "what
+          exactly did it do, over which population" — and without a stated
+          population every rate is an accuracy claim in disguise.
+Impact    2 new core modules, 1 new page, 4 files modified, 4 test files added.
+          Zero tables, indexes, migrations, caches or infrastructure.
+          1,381 vitest + 358 pytest green; 19/19 live checks through the
+          running gateway. Endpoint p50 97ms / p95 111ms against a 500ms budget.
+Notable   The outbox join must be LEFT. Four corpus executions (1,870 overall)
+          have no event_outbox row; an INNER JOIN would have dropped them from
+          every headline figure silently. Proven live: headline 4,918,
+          queue_delay n 4,914, orphans 4.
+Notable   The vocabulary rule targets USE, not characters. A blanket string
+          scan fails on the page's own required disclaimers, and the way to
+          make it pass is to delete them. `uncalibrated` is a denial, not a
+          claim, so term matching requires the term to begin a word.
+Behaviour One deliberate change: `confidence` and `prompt_version` are now
+          exposed by /admin/api/ai/executions. Phase 3 excluded them for
+          tidiness, not safety — neither derives from ticket text. `result`
+          and `error_message` remain excluded. ai-ops.test.ts updated to the
+          new contract, still an exhaustive key assertion.
+Withdrawn The earlier claim that attempt>6 came from replay re-claims. All 58
+          such rows are `noop`, none in the corpus, and the cause is unknown.
+Phase     Phase 17 - COMPLETE, pending review. Not committed.
 ```

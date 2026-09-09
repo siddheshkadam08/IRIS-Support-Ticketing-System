@@ -6,6 +6,11 @@ import { writeAudit } from '../audit/index.js';
 import { emitEvent } from '../events/outbox.js';
 import { logger } from '../logger.js';
 import { assertTenant, requireRole, resolveAdminCaller } from './admin.context.js';
+import {
+  assertGovernedFeature,
+  buildGovernanceReport,
+  resolveWindow,
+} from './governance.service.js';
 
 /**
  * AI operations — Phase 3 Step 8.
@@ -46,6 +51,27 @@ const ListQuery = z.object({
 });
 
 /**
+ * Phase 17 — the governance aggregate query.
+ *
+ * `feature` is a free string here rather than an enum so that an unsupported
+ * value produces the explanatory 400 from `assertGovernedFeature` — "noop is
+ * outside the governance corpus" — instead of a generic schema rejection that
+ * tells an operator nothing about why.
+ */
+const GovernanceQuery = z.object({
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
+  product_id: z.string().max(64).optional(),
+  feature: z.string().max(64).optional(),
+  provider: z.string().max(64).optional(),
+  model: z.string().max(128).optional(),
+  prompt_version: z.string().max(64).optional(),
+});
+
+/** Sections in the governance response, for the structured log. */
+const SECTION_COUNT = 14;
+
+/**
  * The projection is a WHITELIST, not `SELECT *`.
  *
  * `ai_execution` also holds `result` — validated model output — and
@@ -54,8 +80,24 @@ const ListQuery = z.object({
  * started leaking them the day a column was added. Diagnosis needs the
  * identity, the outcome and the machine-readable cause; that is all.
  */
+/**
+ * Phase 17 widened this by seven columns: provider, model, model_version,
+ * prompt_version, latency_ms, confidence and fallback_used.
+ *
+ * ⚠️ `result` AND `error_message` REMAIN EXCLUDED, and the reason has not
+ * changed. `result` is validated model output; `error_message` is bounded and
+ * sanitised but still derived from an upstream string that can quote the prompt
+ * a provider refused. Neither is needed to answer "what happened to this
+ * execution?", and adding them here would put ticket-derived text on an
+ * operational screen for the sake of convenience.
+ *
+ * `confidence` is safe to expose and `latency_ms` is a number IRIS measured
+ * itself. Both are provenance, not content.
+ */
 const VIEW_COLUMNS = `id AS execution_id, event_id, feature, job_id, product_id,
-                      ticket_id, status, attempt, error_code, created_at, completed_at`;
+                      ticket_id, status, attempt, error_code, created_at, completed_at,
+                      provider, model, model_version, prompt_version,
+                      latency_ms, confidence, fallback_used`;
 
 interface ExecutionView {
   execution_id: string;
@@ -69,12 +111,23 @@ interface ExecutionView {
   error_code: string | null;
   created_at: Date;
   completed_at: Date | null;
+  provider: string | null;
+  model: string | null;
+  model_version: string | null;
+  prompt_version: string | null;
+  latency_ms: number | null;
+  /** numeric in Postgres, so pg hands it back as a string. */
+  confidence: string | null;
+  fallback_used: boolean;
 }
 
 const serialise = (r: ExecutionView) => ({
   ...r,
   created_at: r.created_at.toISOString(),
   completed_at: r.completed_at?.toISOString() ?? null,
+  // ⚠️ A number, and nothing more. It is the model's own uncalibrated signal;
+  // no field here turns it into a probability that the answer was right.
+  confidence: r.confidence === null ? null : Number(r.confidence),
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -225,6 +278,76 @@ export async function aiOpsRoutes(app: FastifyInstance): Promise<void> {
         data: rows.map(serialise),
         page: { limit: q.limit, offset: q.offset, total: Number(counted[0]!.n) },
       };
+    });
+  });
+
+  /**
+   * GET /admin/api/ai/governance — Phase 17.
+   *
+   * ⚠️ READ-ONLY, AGGREGATE ONLY, AND IT ADDS NO STORAGE. No table, no index,
+   * no migration, no cache, no materialized view, no warehouse. It is a read
+   * model over `ai_execution`, `audit_event` and `event_outbox`, computed on
+   * demand because at this scale that costs less than a millisecond per hundred
+   * rows and cannot go stale.
+   *
+   * Isolation is RLS, exactly as everywhere else. The route never writes
+   * `WHERE product_id = ANY(app_scope())` itself — for a super_admin that array
+   * is EMPTY and the platform view would silently return nothing, which is the
+   * kind of bug that looks like "no data" rather than like a defect.
+   */
+  app.get('/admin/api/ai/governance', async (req) => {
+    const caller = resolveAdminCaller(req);
+    // An agent works tickets; governance figures are a management surface.
+    requireRole(caller, 'super_admin', 'product_admin', 'manager');
+
+    const parsed = GovernanceQuery.safeParse(req.query);
+    if (!parsed.success) {
+      throw new AppError('invalid_request', 'Invalid governance query parameters.');
+    }
+    const q = parsed.data;
+
+    const window = resolveWindow({ from: q.from, to: q.to });
+    // ⚠️ 400, not an empty page — see assertGovernedFeature.
+    const feature = assertGovernedFeature(q.feature);
+    // Out-of-scope product answers exactly as a non-existent one would: the
+    // platform's customer list is not a thing an endpoint should confirm.
+    if (q.product_id) assertTenant(caller, q.product_id);
+
+    return withScope(caller.scope, async (tx) => {
+      const started = Date.now();
+      const report = await buildGovernanceReport(tx, {
+        from: window.from,
+        to: window.to,
+        days: window.days,
+        productId: q.product_id ?? null,
+        feature,
+        provider: q.provider ?? null,
+        model: q.model ?? null,
+        promptVersion: q.prompt_version ?? null,
+      });
+
+      logger.info(
+        {
+          request_id: caller.scope.requestId,
+          product_id: q.product_id ?? (caller.isSuper ? 'platform' : caller.scopes.join(',')),
+          window_from: report.window.from,
+          window_to: report.window.to,
+          scoped: report.population.scoped,
+          corpus: report.population.corpus,
+          headline: report.population.headline,
+          replays: report.population.replays,
+          identity_holds: report.population.identity_holds,
+          sections_returned: SECTION_COUNT,
+          total_ms: Date.now() - started,
+          governance_version: report.meta.governance_version,
+        },
+        // ⚠️ Counts and machine values only. No ticket text, no error message,
+        // no display name — the log is not a back door into the data the
+        // response itself is careful not to expose.
+        'AI governance report served',
+      );
+
+      return report;
     });
   });
 

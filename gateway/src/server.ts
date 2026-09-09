@@ -65,6 +65,40 @@ interface Caller {
   rateKey: string;
 }
 
+/**
+ * Response headers that must survive the proxy hop — Phase 19 Step 1.
+ *
+ * ⚠️ THE PROXY REBUILDS THE RESPONSE, SO IT IS ALLOW-LIST BY DEFAULT — AND
+ * THAT SILENTLY DROPPED THESE.
+ *
+ * Both handlers below construct a fresh reply rather than streaming upstream's,
+ * so only the headers they name explicitly reach the browser. `content-type`
+ * was named; these were not. core-service has always set them on attachment
+ * downloads — `Content-Disposition: attachment`, `X-Content-Type-Options:
+ * nosniff` and a sandbox CSP are what stop an uploaded file being rendered
+ * inline in an authenticated session (docs/HLD.md §16.3) — so the protection
+ * existed on the origin and nowhere the browser could see it.
+ *
+ * Found by running-system verification, not by a unit test: injecting straight
+ * into core-service shows the headers present, because the hop that removes
+ * them is this one.
+ *
+ * Forwarded only when upstream actually set them, so JSON responses are
+ * unaffected.
+ */
+const PASSTHROUGH_RESPONSE_HEADERS = [
+  'content-disposition',
+  'x-content-type-options',
+  'content-security-policy',
+] as const;
+
+function forwardSafetyHeaders(upstream: Response, reply: FastifyReply): void {
+  for (const name of PASSTHROUGH_RESPONSE_HEADERS) {
+    const value = upstream.headers.get(name);
+    if (value) reply.header(name, value);
+  }
+}
+
 export async function buildGateway() {
   const app = Fastify({
     loggerInstance: logger,
@@ -417,6 +451,7 @@ export async function buildGateway() {
       reply.header('Set-Cookie', clearedSessionCookie());
     }
 
+    forwardSafetyHeaders(upstream, reply);
     return reply
       .status(upstream.status)
       .type(upstream.headers.get('content-type') ?? 'application/json')
@@ -469,8 +504,9 @@ export async function buildGateway() {
 
     const payload = Buffer.from(await upstream.arrayBuffer());
     const contentType = upstream.headers.get('content-type') ?? 'application/json';
-    const disposition = upstream.headers.get('content-disposition');
-    if (disposition) reply.header('Content-Disposition', disposition);
+    // Was forwarding Content-Disposition alone; nosniff and the sandbox CSP
+    // were dropped on exactly the responses that need them most.
+    forwardSafetyHeaders(upstream, reply);
     return reply.status(upstream.status).type(contentType).send(payload);
   });
 

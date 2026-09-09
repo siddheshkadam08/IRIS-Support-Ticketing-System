@@ -8,6 +8,7 @@ import {
   isSupportedFeature,
   notFound,
   type AIFeature,
+  type AIImageInput,
   type AIInputRequest,
   type AIInputResponse,
   type AIResultRequest,
@@ -23,6 +24,8 @@ import type { ProductConfig } from '../products/product.repo.js';
 import { claimExecution, completeExecution } from './ai.repo.js';
 import { validateClassification } from './classification.validator.js';
 import { validateSummary } from './summary.validator.js';
+import { validateScreenshot } from './screenshot.validator.js';
+import { attachmentIdFromPayload, resolveScreenshotImage } from './screenshot.input.js';
 import { classificationSourceFor } from './classification.rules.js';
 import { applyClassification, applySummary } from '../tickets/ticket.repo.js';
 
@@ -56,6 +59,8 @@ interface ResolvedAIEvent {
   ticketId: string;
   correlationId: string;
   productConfig: ProductConfig;
+  /** The outbox payload Core wrote. Authoritative, like every field above. */
+  payload: Record<string, unknown>;
 }
 
 interface OutboxIdentityRow {
@@ -64,6 +69,7 @@ interface OutboxIdentityRow {
   aggregate_id: string | null;
   event_type: string;
   request_id: string | null;
+  payload: Record<string, unknown> | null;
   config: ProductConfig | null;
 }
 
@@ -86,7 +92,7 @@ async function resolveAIEvent(eventId: string): Promise<ResolvedAIEvent> {
   const row = await withSystemScope(`ai-resolve:${eventId}`, async (tx) => {
     const { rows } = await tx.query<OutboxIdentityRow>(
       `SELECT e.product_id, e.aggregate, e.aggregate_id, e.event_type, e.request_id,
-              p.config
+              e.payload, p.config
          FROM event_outbox e
          LEFT JOIN product p ON p.id = e.product_id
         WHERE e.event_id = $1`,
@@ -111,6 +117,17 @@ async function resolveAIEvent(eventId: string): Promise<ResolvedAIEvent> {
     ticketId: row.aggregate_id,
     correlationId: row.request_id ?? eventId,
     productConfig: row.config ?? {},
+    /**
+     * Phase 19. CORE'S OWN COPY of what the event said, read back from the row
+     * Core wrote inside the linking transaction.
+     *
+     * The screenshot path needs an attachment id, and this is where it comes
+     * from — never from the worker, never from the queue payload, never from
+     * anything a caller could influence. `AIJob` has no attachment field at
+     * all, so there is nothing to spoof: the only caller-supplied value in the
+     * whole flow is the event id in the URL, exactly as it was before.
+     */
+    payload: row.payload ?? {},
   };
 }
 
@@ -342,7 +359,40 @@ const FEATURE_VALIDATORS: Record<
       code: 'unsupported_feature',
       message: 'copilot does not travel on the AI job queue',
     }),
+    /**
+     * Phase 19. The FIRST feature added to this map since Phase 5 that is a
+     * real queue participant rather than a second lock on a closed door.
+     *
+     * ⚠️ IT RETURNS NO `decision`. Only `classification` does, and only
+     * `classification` may: a `decision` is what the persistence step below
+     * reads to change a ticket's category, severity or routing. Screenshot
+     * output is evidence, so it produces a validated value and nothing that
+     * the ticket-update step will act on. The absence of that field is the
+     * decision boundary, expressed where it is enforced.
+     */
+    screenshot: (data) => {
+      const result = validateScreenshot(data);
+      if (!result.ok) return { ok: false, code: result.code, message: result.message };
+      return { ok: true, value: { ...result.value } };
+    },
   };
+
+/**
+ * The one comparable scalar a feature defines, if it defines one.
+ *
+ * `classification` is handled by its composite above. `summary` and `noop`
+ * return null because neither produces a comparable number and inventing one
+ * would be fabrication. `screenshot` returns the model's own self-reported
+ * confidence, already range-checked by its validator.
+ */
+function featureConfidence(
+  feature: AIFeature,
+  validated: Record<string, unknown> | null,
+): number | null {
+  if (feature !== 'screenshot' || !validated) return null;
+  const c = validated.confidence;
+  return typeof c === 'number' && Number.isFinite(c) ? c : null;
+}
 
 function notImplemented(feature: string) {
   return (): FeatureValidation => ({
@@ -417,6 +467,73 @@ export async function getAIInput(
     // purpose — a 403 here would confirm that a ticket with that id exists.
     if (!ticket) throw notFound('No such ticket is visible for this AI job.');
 
+    /**
+     * ── Phase 19: the screenshot image ────────────────────────────────
+     *
+     * Resolved from CORE'S OWN outbox payload, authorized against the ticket
+     * and product Core resolved from the same row, and bounded before a single
+     * byte is handed to the worker. The worker never names an attachment.
+     */
+    let image: AIImageInput | undefined;
+    if (feature === 'screenshot') {
+      const outcome = await resolveScreenshotImage({
+        ticketId: event.ticketId,
+        productId: event.productId,
+        payload: event.payload,
+        requestId: event.correlationId,
+      });
+
+      if (!outcome.ok) {
+        /**
+         * ⚠️ TERMINATED HERE, NOT THROWN.
+         *
+         * Every screenshot input failure is permanent — a wrong tenant, an
+         * ineligible type, an oversized image and bytes that are not the image
+         * they claim to be all return the same answer on every retry. Throwing
+         * a 4xx would be classified by the worker as permanent too, but it
+         * would leave the execution row `running` until the reaper swept it,
+         * reporting a real, explainable outcome as abandoned work.
+         *
+         * So the execution is completed as `failed` with its own code, in this
+         * transaction, and the worker is told the same thing it is told about a
+         * duplicate: this is terminal, do not call the AI service. That reuses
+         * the existing short-circuit rather than widening the response contract
+         * for a case that means exactly what the existing arm means — there is
+         * nothing left to do and no model call to make.
+         */
+        await completeExecution(tx, {
+          eventId: event.eventId,
+          feature,
+          status: 'failed',
+          provider: null,
+          model: null,
+          modelVersion: null,
+          promptVersion: null,
+          confidence: null,
+          latencyMs: null,
+          result: null,
+          fallbackUsed: false,
+          errorCode: outcome.code,
+          errorMessage: outcome.message,
+        });
+
+        logger.info(
+          { eventId, feature, executionId: execution.id, code: outcome.code },
+          'screenshot input rejected — terminal, AI service will not be called',
+        );
+
+        return {
+          status: 'already_applied',
+          feature,
+          correlation_id: event.correlationId,
+          execution_id: execution.id,
+          execution_status: 'failed',
+        };
+      }
+
+      image = outcome.image;
+    }
+
     return {
       status: 'ready',
       feature,
@@ -428,6 +545,7 @@ export async function getAIInput(
       },
       taxonomy: taxonomyFor(event.productConfig),
       thresholds: thresholdsFor(event.productConfig),
+      ...(image ? { image } : {}),
     };
   });
 }
@@ -499,6 +617,30 @@ export async function submitAIResult(
        * or defended afterwards. "Why did this auto-route in March?" must be
        * answerable from the row, not from today's config.
        */
+      /**
+       * Phase 19. The attachment id is stamped onto the validated screenshot
+       * result HERE, re-derived from the event payload Core wrote.
+       *
+       * ⚠️ RE-DERIVED, NOT REMEMBERED. Carrying it from the input step in
+       * process memory would not survive a restart between the two calls, and
+       * the two calls are separated by a provider round trip. Reading it back
+       * from the same authoritative row makes the value identical and the code
+       * stateless.
+       *
+       * ⚠️ AND NOT TAKEN FROM THE MODEL. `screenshot_attachment_id` is not an
+       * accepted key in the screenshot schema, so a model returning one is
+       * rejected as an unexpected field. This value can only come from Core.
+       */
+      if (feature === 'screenshot' && validation.ok && validation.value) {
+        const attachmentId = attachmentIdFromPayload(event.payload);
+        if (attachmentId) {
+          validation = {
+            ...validation,
+            value: { ...validation.value, screenshot_attachment_id: attachmentId },
+          };
+        }
+      }
+
       validatedResult = validation.decision
         ? {
             ...(validation.value ?? {}),
@@ -525,12 +667,58 @@ export async function submitAIResult(
       model: req.result.model ?? null,
       modelVersion: req.result.model_version ?? null,
       promptVersion: req.result.prompt_version ?? null,
-      confidence: req.result.confidence ?? null,
+      /**
+       * ⚠️ CORE'S COMPOSITE, NOT THE MODEL'S — and not `req.result.confidence`,
+       * which is always null by design.
+       *
+       * `features.py` deliberately returns `confidence=None` for every feature:
+       * "the weakest-link composite is computed by CORE, from these same
+       * numbers. Reporting one here too would be a second source of truth for a
+       * value Core must own." Taking that null and storing it left the column
+       * empty in all 12,787 historical rows while the real value sat one level
+       * down in `result.decision`.
+       *
+       * So the column now carries the FEATURE-LEVEL SCALAR where the feature
+       * defines one:
+       *
+       *   classification -> compositeConfidence(), the MINIMUM of the four
+       *                     field confidences the model reported
+       *   summary, noop  -> NULL. Neither produces a comparable scalar, and
+       *                     inventing one would be fabrication.
+       *
+       * ⚠️ IT IS NOT A PROBABILITY OF CORRECTNESS. It is the model's own
+       * self-reported signal, uncalibrated — which is precisely why
+       * `auto_route_p1 = 1.01` disables unattended routing. Per-field values
+       * remain in `result` for anyone who needs them; this is the one number
+       * that is comparable across executions of the same feature.
+       */
+      /**
+       * Phase 19 extends the same rule rather than bending it: `screenshot`
+       * DOES define a feature-level scalar — one `confidence` field — so the
+       * column carries it and screenshot executions stay comparable to each
+       * other in the operational view.
+       *
+       * Taken from the VALIDATED value, never from `req.result.confidence`, so
+       * the stored number is one Core range-checked itself. It is the model's
+       * self-report and nothing here or downstream may present it as accuracy.
+       */
+      confidence: validation?.decision?.composite_confidence ?? featureConfidence(feature, validatedResult),
       latencyMs: req.result.latency_ms ?? null,
       result: validatedResult,
       fallbackUsed: req.result.fallback_used ?? false,
       errorCode,
-      errorMessage,
+      /**
+       * ⚠️ SANITISED BEFORE IT BECOMES GOVERNANCE TELEMETRY — finding G-13.
+       *
+       * This field is about to be read by people rather than only by whoever
+       * is debugging right now, and its content is not ours: `ai-client.ts`
+       * puts up to 500 characters of the AI service's response body here, and
+       * that body can carry a provider message that quotes the prompt. Azure's
+       * content-filter rejection, for instance, echoes part of what it
+       * refused. Observed max today is 78 characters, but the schema allows
+       * 2,000 and the ceiling is what matters for a durable store.
+       */
+      errorMessage: sanitiseErrorMessage(errorMessage),
     });
 
     // Zero rows updated: the execution was already terminal. This is a
@@ -648,3 +836,60 @@ export async function submitAIResult(
     };
   });
 }
+
+/**
+ * Bound and clean a failure message before it is stored — finding G-13.
+ *
+ * `ai_execution.error_message` becomes a Phase 17 governance surface, and its
+ * content originates outside IRIS: the worker forwards up to 500 characters of
+ * the AI service's response body, which may in turn carry a provider message
+ * that quotes the prompt it refused.
+ *
+ * ⚠️ WHAT THIS DOES NOT DO: it does not try to detect ticket content. There is
+ * no reliable way to recognise a customer's own words in a provider string, and
+ * a filter that pretended to would be the keyword-matching mistake Phase 15
+ * already measured failing. It reduces the SURFACE — length, structure,
+ * anything that looks like a credential — and the real control stays where it
+ * belongs: this field is not exposed by any API, and Phase 17 must not expose
+ * it either.
+ *
+ * ⚠️ IT DOES NOT DESTROY DIAGNOSTICS. 240 characters comfortably holds every
+ * message the platform generates today (the longest observed is 78), and the
+ * machine-readable reason lives in `error_code`, which is untouched.
+ */
+export function sanitiseErrorMessage(raw: string | null): string | null {
+  if (raw === null) return null;
+
+  const cleaned = raw
+    // Control characters render as noise in a log or a table.
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    // Anything shaped like a bearer token, API key or long opaque secret. A
+    // provider that echoes a credential into an error string must not turn
+    // this column into the place it is durably stored.
+    .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, '[redacted]')
+    .replace(/\bBearer\s+[A-Za-z0-9._-]{8,}/gi, 'Bearer [redacted]')
+    /**
+     * A long opaque token — but only one that MIXES letters and digits.
+     *
+     * ⚠️ The first version of this rule was `[A-Za-z0-9_-]{40,}` with no
+     * variety requirement, and it redacted any long run of a single character.
+     * A truncation test caught it turning a 240-character diagnostic into
+     * "[redacted]". Real credentials have entropy; a long word does not, and
+     * destroying a diagnostic to protect against a secret that was never there
+     * is a bad trade.
+     */
+    .replace(/\b(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{40,}\b/g, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (cleaned.length === 0) return null;
+  return cleaned.length > ERROR_MESSAGE_MAX_CHARS
+    ? `${cleaned.slice(0, ERROR_MESSAGE_MAX_CHARS - 1)}…`
+    : cleaned;
+}
+
+/**
+ * Long enough for every message the platform produces (longest observed: 78),
+ * short enough that a provider cannot use this column as a transcript.
+ */
+export const ERROR_MESSAGE_MAX_CHARS = 240;

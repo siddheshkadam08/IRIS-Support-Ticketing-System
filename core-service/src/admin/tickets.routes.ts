@@ -16,6 +16,8 @@ import { deliveriesForTicket, grantsForTicket, issueGrants, revokeGrants } from 
 import { findSimilar } from '../tickets/similar.service.js';
 import { draftReply } from '../tickets/copilot.service.js';
 import { suggestAssignees } from '../tickets/suggested-assignees.service.js';
+import { storage } from '../storage/index.js';
+import { screenshotResultsForTicket } from '../tickets/screenshot.read.js';
 import { config } from '../config.js';
 import { assertTenant, requireRole, resolveAdminCaller } from './admin.context.js';
 
@@ -80,11 +82,16 @@ export async function adminTicketRoutes(app: FastifyInstance): Promise<void> {
       // Comments and attachments are RLS-gated: an agent sees them only with
       // an active grant. Absence here is the zero-standing-access model
       // working, not an error.
-      const [comments, attachments, grants, deliveries] = await Promise.all([
+      const [comments, attachments, grants, deliveries, screenshotAi] = await Promise.all([
         adminComments(tx, ticket.id),
         listAttachments(tx, ticket.id),
         grantsForTicket(tx, ticket.id),
         deliveriesForTicket(tx, ticket.id),
+        // Phase 19. Read-only, from the execution ledger. Returning it here
+        // rather than on a route of its own means the agent's existing single
+        // request already carries it, and it inherits the same RLS scope the
+        // rest of this handler runs under.
+        screenshotResultsForTicket(tx, ticket.id),
       ]);
 
       const { rows: audit } = await tx.query<{
@@ -144,6 +151,7 @@ export async function adminTicketRoutes(app: FastifyInstance): Promise<void> {
         attachments,
         grants,
         deliveries,
+        screenshot_ai: screenshotAi,
         history: audit.map((a) => ({
           at: a.occurred_at.toISOString(),
           type: a.action,
@@ -434,6 +442,24 @@ export async function adminTicketRoutes(app: FastifyInstance): Promise<void> {
           draft_chars: result.draft?.length ?? 0,
           model: result.diagnostics.model,
           prompt_version: result.diagnostics.prompt_version,
+          /**
+           * ⚠️ LATENCY, added pre-Phase-17 (finding: Copilot computed these and
+           * threw them away at the audit boundary).
+           *
+           * Copilot is the one LLM feature that writes no `ai_execution` row —
+           * it is synchronous and has no outbox event, per the provenance rule
+           * in §44I.4 — so this audit entry is the ONLY durable record that it
+           * ran. Without timings, Phase 17 could report latency for
+           * classification and summary and nothing for the feature a human
+           * actually waits on.
+           *
+           * ⚠️ STILL METADATA ONLY. Numbers and machine values. The draft
+           * remains ephemeral: it is not here, not anywhere else, and Phase 15's
+           * decision that there is no stored draft to send later is untouched.
+           */
+          generation_ms: result.diagnostics.generation_ms,
+          retrieval_ms: result.diagnostics.retrieval_ms,
+          total_ms: result.diagnostics.total_ms,
         },
         sourceIp: req.ip,
       });
@@ -489,6 +515,83 @@ export async function adminTicketRoutes(app: FastifyInstance): Promise<void> {
 
     return reply.status(201).send(result);
   });
+
+  /**
+   * ── GET /admin/api/tickets/:id/attachments/:attachmentId/content ──────
+   *
+   * Phase 19 Step 1. The agent-facing way to actually OPEN an attachment.
+   *
+   * ⚠️ WHY THIS DID NOT EXIST, AND WHY THAT WAS A GAP RATHER THAN A CHOICE.
+   *
+   * `GET /admin/api/tickets/:id` has always returned attachment METADATA —
+   * filename, type, size — and the admin panel never rendered it. The only
+   * content endpoint is `GET /v1/attachments/:id/content`, which authenticates
+   * through `resolveCaller` and an `x-iris-product-id` header the gateway sets
+   * on the `/v1` path only. An admin session arrives on `/admin/api/*` with
+   * support-user headers instead, so an agent had no route to the bytes at all.
+   * Screenshot AI is about to interpret images no agent can look at, which is
+   * not a reviewable feature.
+   *
+   * ⚠️ NESTED UNDER THE TICKET ON PURPOSE. An `/admin/api/attachments/:id`
+   * route would make the attachment id sufficient on its own; RLS would still
+   * scope it to the caller's products, but nothing would tie the file to the
+   * ticket the agent is looking at. Requiring both means the relationship is
+   * checked in the statement — `a.ticket_id = t.id` — rather than assumed.
+   *
+   * ⚠️ THE RESPONSE HEADERS ARE COPIED FROM THE /v1 ROUTE VERBATIM AND MUST
+   * STAY THAT WAY. `application/octet-stream` plus `Content-Disposition:
+   * attachment`, `nosniff` and a sandbox CSP is what stops an attachment being
+   * rendered inline inside an authenticated portal session — the stored-XSS
+   * case in docs/HLD.md §16.3, which is strictly WORSE here than on /v1
+   * because this session belongs to staff. The panel previews images by
+   * fetching this response and building a blob URL under a fixed type of its
+   * own choosing; it never asks the server to declare an image type.
+   *
+   * `blob_key` is read but never returned. It is an internal storage path.
+   */
+  app.get<{ Params: { id: string; attachmentId: string } }>(
+    '/admin/api/tickets/:id/attachments/:attachmentId/content',
+    async (req, reply) => {
+      const caller = resolveAdminCaller(req);
+
+      const row = await withScope(caller.scope, async (tx) => {
+        /**
+         * ONE statement, joined, so a foreign-product attachment and a
+         * wrong-ticket attachment fail identically and for the same reason:
+         * both `attachment` and `ticket` carry FORCE ROW LEVEL SECURITY, so a
+         * row outside the caller's scope is simply not there to join.
+         */
+        const { rows } = await tx.query<{
+          blob_key: string;
+          filename: string;
+          product_id: string;
+        }>(
+          `SELECT a.blob_key, a.filename, a.product_id
+             FROM attachment a
+             JOIN ticket t ON t.id = a.ticket_id
+            WHERE a.id = $1
+              AND (t.id = $2 OR upper(t.reference) = upper($2))`,
+          [req.params.attachmentId, req.params.id],
+        );
+        return rows[0] ?? null;
+      });
+
+      // Same not-found shape whether it does not exist, is not visible, or
+      // belongs to another ticket. Distinguishing them would confirm which
+      // attachment ids are real.
+      if (!row) throw notFound('No such attachment is visible to this account.');
+      assertTenant(caller, row.product_id);
+
+      const data = await storage.get(row.blob_key);
+
+      return reply
+        .header('Content-Type', 'application/octet-stream')
+        .header('Content-Disposition', `attachment; filename="${encodeURIComponent(row.filename)}"`)
+        .header('X-Content-Type-Options', 'nosniff')
+        .header('Content-Security-Policy', "default-src 'none'; sandbox")
+        .send(data);
+    },
+  );
 }
 
 /** Admin view includes internal notes; the product-facing one never does. */

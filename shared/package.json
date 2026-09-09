@@ -10,7 +10,9 @@
     ".": "./index.ts",
     "./hmac": "./hmac-utils/ts/index.ts",
     "./types": "./types/index.ts",
-    "./widget-config": "./types/widget-config.ts"
+    "./widget-config": "./types/widget-config.ts",
+    "./kb": "./types/kb.ts",
+    "./screenshot": "./types/screenshot.ts"
   },
   "scripts": {
     "test": "vitest run"

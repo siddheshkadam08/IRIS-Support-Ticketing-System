@@ -8,6 +8,19 @@ export default defineConfig({
     alias: {
       '@iris/shared/hmac': r('./shared/hmac-utils/ts/index.ts'),
       '@iris/shared/types': r('./shared/types/index.ts'),
+      /**
+       * Phase 18. Listed BEFORE the bare '@iris/shared' entry: string aliases
+       * match by prefix in order, so the generic one would rewrite
+       * '@iris/shared/kb' to 'shared/index.ts/kb' and fail to resolve.
+       *
+       * The subpath exists so the admin panel can import the KB lifecycle rules
+       * as VALUES without pulling in the types barrel, which re-exports ids.ts
+       * and therefore `node:crypto`. Vite resolves it through the package
+       * exports map; vitest needs it spelled out here because these aliases
+       * take precedence over that map.
+       */
+      '@iris/shared/kb': r('./shared/types/kb.ts'),
+      '@iris/shared/screenshot': r('./shared/types/screenshot.ts'),
       '@iris/shared': r('./shared/index.ts'),
     },
   },

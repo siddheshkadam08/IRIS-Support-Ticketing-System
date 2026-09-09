@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -7,6 +7,7 @@ import {
   type CopilotDraft,
   type Delivery,
   type Grant,
+  type ScreenshotResultDTO,
   type SimilarTicket,
   type TicketDetail as TDetail,
 } from '../api/client';
@@ -283,6 +284,32 @@ export default function TicketDetail() {
 
           <Card title="Activity" style={{ marginBottom: 14 }}>
             <Timeline ticket={ticket} />
+          </Card>
+
+          {/*
+            Phase 19 Step 1. The API has always returned this list; nothing
+            rendered it, so an agent could not see that a ticket even HAD a
+            screenshot, let alone open one.
+          */}
+          <Card title={`Attachments (${ticket.attachments.length})`} style={{ marginBottom: 14 }}>
+            {ticket.attachments.length === 0 ? (
+              <div style={{ fontSize: 12.5, color: 'var(--muted)' }}>
+                {ticket.access.has_platform_grant
+                  ? 'No files were attached to this ticket.'
+                  : 'Attachments are hidden without an active access grant.'}
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gap: 10 }}>
+                {ticket.attachments.map((a) => (
+                  <AttachmentRow
+                    key={a.id}
+                    ticketId={ticket.id}
+                    attachment={a}
+                    screenshot={(ticket.screenshot_ai ?? []).find((s) => s.attachment_id === a.id)}
+                  />
+                ))}
+              </div>
+            )}
           </Card>
 
           {ticket.access.has_platform_grant ? (
@@ -699,6 +726,239 @@ function SimilarCard({ item, onOpen }: { item: SimilarTicket; onOpen: () => void
         {item.resolved_at ? ` · ${absTime(item.resolved_at)}` : ''}
       </div>
     </button>
+  );
+}
+
+/**
+ * Image types this page is willing to render inline — Phase 19 Step 1.
+ *
+ * ⚠️ THE TYPE COMES FROM THIS LIST, NEVER FROM THE SERVER RESPONSE.
+ *
+ * The endpoint replies `application/octet-stream` deliberately, so nothing can
+ * be rendered by asking the browser to trust a content type an uploader chose.
+ * To preview, the page fetches the bytes and builds a blob URL under a type it
+ * picked itself from this constant. `image/svg+xml` is absent and must stay
+ * absent: an SVG rendered in an authenticated staff session executes script.
+ *
+ * `attachment.content_type` is only ever used to LOOK UP a member of this set.
+ * A file claiming any other type gets the download link and no preview.
+ */
+const PREVIEWABLE: Record<string, string> = {
+  'image/png': 'image/png',
+  'image/jpeg': 'image/jpeg',
+  'image/webp': 'image/webp',
+  'image/gif': 'image/gif',
+};
+
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * One attachment: metadata always, an inline preview only for image types this
+ * page recognises, and a download for everything.
+ *
+ * Bytes are fetched lazily — opening a ticket must not pull every attachment
+ * over the wire, and an agent who never looks at a file never causes a read of
+ * it.
+ */
+function AttachmentRow({
+  ticketId,
+  attachment,
+  screenshot,
+}: {
+  ticketId: string;
+  attachment: { id: string; filename: string; content_type: string; size_bytes: number; created_at: string };
+  screenshot?: ScreenshotResultDTO;
+}) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const previewType = PREVIEWABLE[attachment.content_type];
+
+  // A blob URL is a document-lifetime resource. Without this every preview
+  // leaks its buffer until the tab is closed.
+  useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
+
+  async function load(): Promise<string | null> {
+    if (url) return url;
+    setBusy(true);
+    setErr(null);
+    try {
+      const blob = await api.attachmentBlob(ticketId, attachment.id);
+      // Re-typed under OUR chosen MIME, never the server's or the uploader's.
+      const next = URL.createObjectURL(previewType ? new Blob([blob], { type: previewType }) : blob);
+      setUrl(next);
+      return next;
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not load this attachment.');
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function download() {
+    const href = await load();
+    if (!href) return;
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = attachment.filename;
+    a.click();
+  }
+
+  return (
+    <div style={{ border: '1px solid var(--line)', borderRadius: 8, padding: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <span style={{ fontWeight: 600, fontSize: 13, wordBreak: 'break-all' }}>{attachment.filename}</span>
+        <span className="mono" style={{ fontSize: 11, color: 'var(--muted)' }}>
+          {attachment.content_type} · {humanSize(attachment.size_bytes)}
+        </span>
+        <div className="spacer" />
+        {previewType ? (
+          <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void load()}>
+            {busy ? 'Loading…' : url ? 'Loaded' : 'Preview'}
+          </button>
+        ) : null}
+        <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void download()}>
+          Download
+        </button>
+      </div>
+
+      {err ? <div style={{ fontSize: 12, color: '#b91c1c', marginTop: 6 }}>{err}</div> : null}
+
+      {url && previewType ? (
+        <img
+          src={url}
+          alt={attachment.filename}
+          style={{ marginTop: 10, maxWidth: '100%', maxHeight: 420, borderRadius: 6, display: 'block' }}
+        />
+      ) : null}
+
+      {screenshot ? <ScreenshotEvidence result={screenshot} /> : null}
+    </div>
+  );
+}
+
+/**
+ * What the vision model reported about one screenshot — Phase 19.
+ *
+ * ⚠️ THIS IS EVIDENCE, AND THE LAYOUT IS THE ARGUMENT.
+ *
+ * "Observed" comes first, visually separated, because it is the only part an
+ * agent can act on directly: a transcribed error code either is on the screen or
+ * is not. "Possible causes" and "Suggested next steps" are speculation, labelled
+ * as speculation, below it. Presenting the three as one paragraph of prose would
+ * make a guess read exactly like a reading, which is the specific failure this
+ * feature has to avoid.
+ *
+ * ⚠️ NOTHING HERE IS ACTIONABLE BY A CLICK. There is no "apply", no "set
+ * severity", no "use as reply", and no button that copies this text into the
+ * customer response box. The agent reads it and decides. Adding such a control
+ * would move a model output one click from a customer, which is the boundary
+ * Copilot already draws and this feature inherits.
+ */
+function ScreenshotEvidence({ result }: { result: ScreenshotResultDTO }) {
+  const border = { borderTop: '1px solid var(--line)', marginTop: 10, paddingTop: 10 };
+
+  if (result.status === 'running') {
+    return (
+      <div style={{ ...border, fontSize: 12, color: 'var(--muted)' }}>
+        Reading this screenshot…
+      </div>
+    );
+  }
+
+  if (result.status === 'failed' || !result.interpretation) {
+    /**
+     * A failure is SHOWN, not hidden. An agent who cannot see that the analysis
+     * failed will assume the screenshot held nothing worth reporting, which is a
+     * different and wrong conclusion. `error_code` is machine-readable and
+     * carries no upstream prose.
+     */
+    return (
+      <div style={{ ...border, fontSize: 12, color: 'var(--muted)' }}>
+        This screenshot was not interpreted
+        {result.error_code ? ` (${result.error_code})` : ''}. Open it above and read it yourself.
+      </div>
+    );
+  }
+
+  const i = result.interpretation;
+  const heading = { fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase' as const, color: 'var(--muted)', marginBottom: 4 };
+  const list = { margin: 0, paddingLeft: 18, fontSize: 12.5, lineHeight: 1.6 };
+
+  return (
+    <div style={border}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 12, fontWeight: 700 }}>Screenshot evidence</span>
+        <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+          AI-generated. Not a diagnosis, and not shown to the customer.
+        </span>
+      </div>
+
+      {i.observations.length > 0 ? (
+        <div style={{ marginBottom: 10 }}>
+          <div style={heading}>Observed in the image</div>
+          <ul style={list}>
+            {i.observations.map((o, n) => (
+              <li key={n}>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--muted)' }}>
+                  {o.type.replace('_', ' ')}
+                </span>
+                {'  '}
+                {o.value}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <div style={{ ...heading, marginBottom: 10 }}>Nothing identifiable was observed</div>
+      )}
+
+      {i.problem_hint.domain || i.problem_hint.category ? (
+        <div style={{ marginBottom: 10 }}>
+          <div style={heading}>Area hint</div>
+          <div style={{ fontSize: 12.5 }}>
+            {[i.problem_hint.domain, i.problem_hint.category].filter(Boolean).join(' · ')}
+          </div>
+        </div>
+      ) : null}
+
+      {i.possible_causes.length > 0 ? (
+        <div style={{ marginBottom: 10 }}>
+          <div style={heading}>Possible cause — unverified</div>
+          <ul style={list}>
+            {i.possible_causes.map((c, n) => <li key={n}>{c}</li>)}
+          </ul>
+        </div>
+      ) : null}
+
+      {i.suggested_next_steps.length > 0 ? (
+        <div style={{ marginBottom: 10 }}>
+          <div style={heading}>Suggested next step — for you to judge</div>
+          <ul style={list}>
+            {i.suggested_next_steps.map((c, n) => <li key={n}>{c}</li>)}
+          </ul>
+        </div>
+      ) : null}
+
+      {/*
+        ⚠️ THE WORDING IS THE POINT, NOT THE NUMBER.
+        This is the model's own self-report. Phase 4 measured a model returning
+        >=0.95 on nearly every ticket, which is high confidence and says nothing
+        about whether the signal discriminates. It is never rendered as a
+        percentage, never called accuracy, and never described as calibrated.
+      */}
+      <div style={{ fontSize: 11, color: 'var(--muted)' }}>
+        Model-reported confidence {i.confidence.toFixed(2)} of 1. Self-reported by the
+        model and not a measure of accuracy.
+        {result.model ? ` · ${result.model}` : ''}
+      </div>
+    </div>
   );
 }
 

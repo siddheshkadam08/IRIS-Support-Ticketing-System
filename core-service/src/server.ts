@@ -12,6 +12,7 @@ import { authRoutes } from './auth/auth.routes.js';
 import { adminRoutes } from './admin/admin.routes.js';
 import { adminTicketRoutes } from './admin/tickets.routes.js';
 import { aiOpsRoutes } from './admin/ai-ops.routes.js';
+import { kbRoutes } from './knowledge-base/kb.routes.js';
 import { startPublisher, stopPublisher } from './events/publisher.js';
 import { startAIDispatcher, stopAIDispatcher } from './events/ai-dispatcher.js';
 import { startAIReaper, stopAIReaper } from './events/ai-reaper.js';
@@ -94,6 +95,9 @@ export async function buildServer() {
   await app.register(adminTicketRoutes);
   // Phase 3 Step 8: operational read + safe replay over ai_execution.
   await app.register(aiOpsRoutes);
+  // Phase 18: KB authoring and lifecycle. Admin surface only — the widget's
+  // read-only KB endpoints stay in widgetRoutes above and are untouched.
+  await app.register(kbRoutes);
   // Service-to-service only. Authenticated by the x-internal-key hook above and
   // never routed by the gateway, which proxies /v1/* and /admin/api/* only.
   await app.register(internalRoutes);

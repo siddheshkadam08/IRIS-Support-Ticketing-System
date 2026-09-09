@@ -94,6 +94,15 @@ def test_the_features_this_service_implements_are_declared_in_the_contract(schem
     # APPLIES results to tickets, and a draft customer reply must never reach a
     # result handler. It runs synchronously inside an authenticated admin
     # request and persists nothing.
+    #
+    # NOTE `screenshot` (Phase 19) is the first MULTIMODAL feature and the first
+    # queue feature added since Phase 5. Unlike embedding, reranking, rag and
+    # copilot it IS present in SUPPORTED_AI_FEATURES on the Core side, because
+    # it genuinely travels on ai.jobs: it is triggered by a durable outbox fact,
+    # it is slow, it costs money and it must survive a provider outage. Its
+    # output is evidence — it has no field for a priority, severity, assignment
+    # or status — so the queue path applying its result mutates no ticket
+    # decision.
     assert set(FEATURES) == {
         "noop",
         "classification",
@@ -102,6 +111,7 @@ def test_the_features_this_service_implements_are_declared_in_the_contract(schem
         "reranking",
         "rag",
         "copilot",
+        "screenshot",
     }
 
 

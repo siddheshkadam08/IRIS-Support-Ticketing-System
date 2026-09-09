@@ -11,13 +11,21 @@ import TicketDetail from './pages/TicketDetail';
 import Agents from './pages/Agents';
 import Tenants from './pages/Tenants';
 import AuditLog from './pages/AuditLog';
+import AIGovernance from './pages/AIGovernance';
+import KnowledgeBase from './pages/KnowledgeBase';
 
 const NAV = [
   { to: '/', label: 'Dashboard', end: true, roles: null },
   { to: '/tickets', label: 'Tickets', roles: null },
   { to: '/agents', label: 'Agents', roles: null },
   { to: '/tenants', label: 'Tenants', roles: null },
+  // Phase 18. No role gate: every staff role may author drafts. Publishing is
+  // gated by the API, not by hiding the page from the people who write articles.
+  { to: '/knowledge-base', label: 'Knowledge Base', roles: null },
   { to: '/audit', label: 'Audit Logs', roles: ['super_admin', 'product_admin', 'manager'] },
+  // Phase 17. Hidden from agents, who also get a 403 from the API — the nav is
+  // a convenience, never the control.
+  { to: '/ai-governance', label: 'AI Governance', roles: ['super_admin', 'product_admin', 'manager'] },
 ] as const;
 
 const TITLES: Record<string, string> = {
@@ -25,7 +33,9 @@ const TITLES: Record<string, string> = {
   '/tickets': 'Tickets',
   '/agents': 'Agents',
   '/tenants': 'Tenants',
+  '/knowledge-base': 'Knowledge Base',
   '/audit': 'Audit Logs',
+  '/ai-governance': 'AI Governance',
 };
 
 export default function App() {
@@ -101,7 +111,9 @@ export default function App() {
             <Route path="/tickets/:id" element={<TicketDetail />} />
             <Route path="/agents" element={<Agents />} />
             <Route path="/tenants" element={<Tenants />} />
+            <Route path="/knowledge-base" element={<KnowledgeBase />} />
             <Route path="/audit" element={<AuditLog />} />
+            <Route path="/ai-governance" element={<AIGovernance />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </div>

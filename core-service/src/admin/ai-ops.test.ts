@@ -231,17 +231,34 @@ describe('operational query — what happened to this execution', () => {
     const body = res.json();
     expect(body.data).toHaveLength(1);
 
+    /**
+     * ⚠️ WIDENED BY PHASE 17, and still an exact match rather than a subset.
+     *
+     * Seven provenance columns were added — provider, model, model_version,
+     * prompt_version, latency_ms, confidence, fallback_used — so an operator
+     * can answer "which model produced this, and how long did it take?" without
+     * a second query. The list stays exhaustive on purpose: a subset assertion
+     * would let a future `SELECT *` add `result` here unnoticed, which is the
+     * exact failure the whitelist exists to prevent.
+     */
     const row = body.data[0];
     expect(Object.keys(row).sort()).toEqual([
       'attempt',
       'completed_at',
+      'confidence',
       'created_at',
       'error_code',
       'event_id',
       'execution_id',
+      'fallback_used',
       'feature',
       'job_id',
+      'latency_ms',
+      'model',
+      'model_version',
       'product_id',
+      'prompt_version',
+      'provider',
       'status',
       'ticket_id',
     ]);
@@ -265,8 +282,26 @@ describe('operational query — what happened to this execution', () => {
     });
     const serialised = JSON.stringify(res.json());
 
-    for (const forbidden of ['result', 'error_message', 'confidence', 'prompt_version']) {
+    /**
+     * ⚠️ `confidence` AND `prompt_version` MOVED OUT OF THIS LIST IN PHASE 17,
+     * deliberately, and the reasoning is worth keeping.
+     *
+     * Phase 3 excluded them for tidiness rather than for safety: neither is
+     * derived from ticket text or from an upstream string. `confidence` is a
+     * number IRIS computes itself — the weakest link of four the model reported
+     * — and `prompt_version` is a constant this repository ships. Phase 17 needs
+     * both to answer provenance questions, so they are now exposed.
+     *
+     * What has NOT changed is what the exclusion is actually for. `result` is
+     * validated model output and `error_message` is derived from a provider
+     * body that can quote the prompt it refused. Those stay out.
+     */
+    for (const forbidden of ['result', 'error_message']) {
       expect(serialised, `${forbidden} must not appear`).not.toContain(`"${forbidden}"`);
+    }
+    // And the widening is pinned, so it cannot be quietly reverted or extended.
+    for (const present of ['confidence', 'prompt_version', 'provider', 'model']) {
+      expect(serialised, `${present} is part of the Phase 17 projection`).toContain(`"${present}"`);
     }
     expect(serialised).not.toContain('A ticket for Step 8');
     expect(serialised).not.toContain(config.AI_WORKER_HMAC_SECRET);

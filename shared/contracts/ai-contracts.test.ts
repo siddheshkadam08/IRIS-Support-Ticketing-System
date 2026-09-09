@@ -94,8 +94,23 @@ describe('schema and TypeScript cannot drift', () => {
      *
      * Phase 1 supported the stub alone; Phase 4 added classification and
      * Phase 5 added summary.
+     *
+     * Phase 19 added `screenshot` — the first addition since Phase 5, and the
+     * first MULTIMODAL feature. It belongs here where embedding, reranking, rag
+     * and copilot deliberately do not, because it genuinely travels on the
+     * queue: it is triggered by a durable outbox fact, it is slow, it costs
+     * money, and it must survive a provider outage. It has a validator in
+     * FEATURE_VALIDATORS, so it has somewhere legitimate to land — and that
+     * validator returns no `decision`, so applying its result mutates no ticket
+     * field.
+     *
+     * ⚠️ THIS IS THE ONE PLACE THE EXACT SET IS PINNED. The per-feature tests
+     * assert only their own absence; duplicating the full list across five
+     * files meant adding one real queue feature broke four tests that were not
+     * about it.
      */
-    expect(SUPPORTED_AI_FEATURES).toEqual(['noop', 'classification', 'summary']);
+    expect(SUPPORTED_AI_FEATURES).toEqual(['noop', 'classification', 'summary', 'screenshot']);
+    expect(isSupportedFeature('screenshot')).toBe(true);
     expect(isSupportedFeature('noop')).toBe(true);
     expect(isSupportedFeature('classification')).toBe(true);
     expect(isSupportedFeature('summary')).toBe(true);

@@ -113,15 +113,40 @@ export default function AIGovernance() {
   const [feature, setFeature] = useState('');
   const [productId, setProductId] = useState('');
 
-  const to = new Date();
-  const from = new Date(to.getTime() - days * DAY);
-  const qs = new URLSearchParams({ from: from.toISOString(), to: to.toISOString() });
-  if (feature) qs.set('feature', feature);
-  if (productId) qs.set('product_id', productId);
+  /**
+   * ⚠️ THE TIMESTAMPS BELONG IN `queryFn`, NEVER IN `queryKey`.
+   *
+   * The key is the IDENTITY OF THE VIEW the user selected, not the instant at
+   * which React happened to render. Building `to` from `new Date()` during
+   * render and putting it in the key made the key different on every single
+   * render: each render became a new query with no cached data, so `isLoading`
+   * was true again, so the spinner rendered, so the key changed again. The page
+   * never left the spinner and re-requested governance about three times a
+   * second, for as long as it was open.
+   *
+   * Keying on the three selections instead is stable by construction — there is
+   * no clock in it to drift. It also makes the cache work: "the last 30 days,
+   * all features, all tenants" is ONE view, so returning to the page reuses it,
+   * where a key carrying a timestamp could never hit twice.
+   *
+   * ⚠️ The window is still computed fresh at FETCH time, so it tracks real time
+   * exactly as before. And there is no stale-closure hazard here by
+   * construction: the closure reads `days`, `feature` and `productId`, and the
+   * key contains `days`, `feature` and `productId` — the same set, so an older
+   * closure could not build a different request.
+   */
+  const buildQuery = () => {
+    const to = new Date();
+    const from = new Date(to.getTime() - days * DAY);
+    const qs = new URLSearchParams({ from: from.toISOString(), to: to.toISOString() });
+    if (feature) qs.set('feature', feature);
+    if (productId) qs.set('product_id', productId);
+    return qs.toString();
+  };
 
   const { data, isLoading, error } = useQuery<GovernanceResponse>({
-    queryKey: ['ai-governance', qs.toString()],
-    queryFn: () => api.aiGovernance(qs.toString()),
+    queryKey: ['ai-governance', days, feature, productId],
+    queryFn: () => api.aiGovernance(buildQuery()),
   });
 
   if (isLoading) return <Spinner />;

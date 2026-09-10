@@ -173,3 +173,69 @@ describe('⚠️ presentation rules that keep a number honest', () => {
     expect(denominators).toBeGreaterThanOrEqual(8);
   });
 });
+
+describe('the query key is the identity of the VIEW, not of the moment', () => {
+  /**
+   * The regression this locks down. `queryKey` once carried the ISO timestamps
+   * built by `new Date()` during render, so it differed on every render: each
+   * render was a new query with no cached data, `isLoading` stayed true, the
+   * spinner re-rendered, and the key changed again. The page never displayed
+   * anything and re-requested governance about three times a second.
+   *
+   * These assertions read the source because the repository has no DOM test
+   * environment for a .tsx page. They are narrow on purpose: they pin the one
+   * property that failed, not the shape of the component.
+   */
+  const KEY = SOURCE.match(/queryKey:\s*\[[^\]]*\]/)?.[0] ?? '';
+
+  it('has a queryKey at all', () => {
+    expect(KEY).not.toBe('');
+  });
+
+  it('keys on the three selections the user actually chose', () => {
+    for (const part of ['days', 'feature', 'productId']) expect(KEY).toContain(part);
+  });
+
+  it('CANNOT contain a clock reading, which is what caused the loop', () => {
+    expect(KEY).not.toMatch(/toISOString/);
+    expect(KEY).not.toMatch(/\bDate\b/);
+    expect(KEY).not.toMatch(/\bfrom\b/);
+    expect(KEY).not.toMatch(/\bto\b/);
+    expect(KEY).not.toMatch(/qs\b/);
+  });
+
+  it('builds the window where the request is made, not where React renders', () => {
+    // The timestamps still exist; they just live inside the fetch path.
+    expect(SOURCE).toMatch(/const buildQuery = \(\) => \{/);
+    expect(SOURCE).toMatch(/queryFn:.*buildQuery\(\)/);
+    expect(SOURCE).toMatch(/from:\s*from\.toISOString\(\)/);
+    expect(SOURCE).toMatch(/to:\s*to\.toISOString\(\)/);
+  });
+
+  it('still omits an empty feature and an empty tenant from the querystring', () => {
+    expect(SOURCE).toMatch(/if \(feature\) qs\.set\('feature', feature\);/);
+    expect(SOURCE).toMatch(/if \(productId\) qs\.set\('product_id', productId\);/);
+  });
+
+  it('did not reach for a mechanism to paper over an unstable key', () => {
+    // useMemo, useState-for-the-window, an effect or a polling interval would
+    // all damp the symptom while leaving a clock in the key.
+    expect(SOURCE).not.toMatch(/useMemo/);
+    expect(SOURCE).not.toMatch(/useEffect/);
+    expect(SOURCE).not.toMatch(/refetchInterval/);
+  });
+
+  it('still reports the window the SERVER used, not one the client assumed', () => {
+    expect(SOURCE).toMatch(/data\.window\.from/);
+    expect(SOURCE).toMatch(/data\.window\.to/);
+  });
+
+  it('keeps the existing loading and error states', () => {
+    expect(SOURCE).toMatch(/if \(isLoading\) return <Spinner \/>;/);
+    expect(SOURCE).toMatch(/Governance figures are unavailable/);
+  });
+
+  it('keeps the four range options unchanged', () => {
+    for (const d of [1, 7, 30, 90]) expect(SOURCE).toContain('days: ' + d + ',');
+  });
+});

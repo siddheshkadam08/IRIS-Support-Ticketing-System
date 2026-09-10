@@ -4,18 +4,22 @@ import {
   CONFIDENCE_BUCKET_COUNT,
   CONFIDENCE_DISCLAIMER,
   COPILOT_DISCLAIMER,
+  CORRECTION_DISCLAIMER,
   DISCLAIMER_ATTRIBUTE,
   FAILURE_CATEGORIES,
   FAILURE_CATEGORY_LABEL,
   MAX_GOVERNANCE_WINDOW_DAYS,
+  GOVERNANCE_UNMEASURABLE,
   MIN_SAMPLE_FOR_RATE,
   NO_ACCURACY_DISCLAIMER,
   OPERATIONAL_COUNTS_DISCLAIMER,
   POPULATION_LAYERS,
   PROHIBITED_CLAIM_TERMS,
+  SAMPLE_STATES,
   assertsProhibitedClaim,
   confidenceBucketLabel,
   failureCategoryOf,
+  sampleStateOf,
 } from './index.js';
 
 /**
@@ -214,5 +218,120 @@ describe('population layers and thresholds', () => {
   it('the disclaimers say what is absent, not what is good', () => {
     expect(OPERATIONAL_COUNTS_DISCLAIMER).toContain('do not measure');
     expect(COPILOT_DISCLAIMER).toContain('not recorded');
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// Phase 21 — sample states and correction vocabulary
+// ═════════════════════════════════════════════════════════════════════════
+
+describe('⚠️ the three sample states, and why a boolean was not enough', () => {
+  it('names exactly the three states', () => {
+    expect([...SAMPLE_STATES]).toEqual(['none', 'insufficient', 'sufficient']);
+  });
+
+  /**
+   * ⚠️ THE DISTINCTION THE OLD BOOLEAN COULD NOT MAKE. "Nothing happened" and
+   * "too little happened to divide" are different facts, and a single
+   * `rate_suppressed` flag collapses them — leaving the reader to guess, and
+   * usually to guess zero.
+   */
+  it('separates no observations from too few observations', () => {
+    expect(sampleStateOf(0)).toBe('none');
+    expect(sampleStateOf(1)).toBe('insufficient');
+  });
+
+  it('turns sufficient exactly at the shared threshold, not near it', () => {
+    expect(sampleStateOf(MIN_SAMPLE_FOR_RATE - 1)).toBe('insufficient');
+    expect(sampleStateOf(MIN_SAMPLE_FOR_RATE)).toBe('sufficient');
+    expect(sampleStateOf(MIN_SAMPLE_FOR_RATE + 1)).toBe('sufficient');
+  });
+
+  /** A negative denominator is nonsense, but it must not read as sufficient. */
+  it('treats a nonsensical denominator as no observations', () => {
+    expect(sampleStateOf(-1)).toBe('none');
+  });
+
+  it('every state is one of the declared three', () => {
+    for (const d of [0, 1, 29, 30, 31, 1000]) {
+      expect(SAMPLE_STATES as readonly string[]).toContain(sampleStateOf(d));
+    }
+  });
+});
+
+describe('⚠️ corrections are counted, and a correction rate still is not', () => {
+  /**
+   * Phase 20 made corrections possible and Phase 21 counts them. The
+   * DENOMINATOR is what is still missing: a correction and the classification
+   * it replaced fall in different windows, and a corrected ticket's source
+   * becomes 'human', so it leaves any ticket-table denominator as the numerator
+   * grows. Dropping this entry would be the moment the page starts lying.
+   */
+  it('keeps human_correction_rate on the unmeasurable list', () => {
+    expect(GOVERNANCE_UNMEASURABLE).toContain('human_correction_rate');
+  });
+
+  it('keeps accuracy and cost unmeasurable too', () => {
+    expect(GOVERNANCE_UNMEASURABLE).toContain('accuracy');
+    expect(GOVERNANCE_UNMEASURABLE).toContain('cost');
+    expect(GOVERNANCE_UNMEASURABLE).toContain('token_usage');
+  });
+
+  it('the correction disclaimer denies the causal claim rather than making it', () => {
+    expect(CORRECTION_DISCLAIMER).toContain('does not establish');
+    expect(CORRECTION_DISCLAIMER).toContain('authorized human');
+  });
+
+  /**
+   * ⚠️ The disclaimer contains the word "wrong", which is exactly the kind of
+   * copy a blanket string scan would have deleted. It is a denial, so it is
+   * allowed — the same exemption the confidence disclaimer relies on.
+   */
+  it('the disclaimer is prose, and prose is exempt via the attribute', () => {
+    expect(DISCLAIMER_ATTRIBUTE).toBe('data-governance-disclaimer');
+  });
+
+  /**
+   * ⚠️ THE NAMES THAT WOULD HAVE BEEN EASY AND WRONG. Every key the correction
+   * panel publishes is checked against the vocabulary rule here, because the
+   * obvious labels for this feature are the forbidden ones.
+   */
+  it('no correction response key asserts a prohibited claim', () => {
+    const keys = [
+      'corrections',
+      'applies_to_filter',
+      'events',
+      'tickets',
+      'tickets_corrected_more_than_once',
+      'events_without_ticket',
+      'category_changes',
+      'severity_changes',
+      'severity_overrides',
+      'override_eligible',
+      'severity_override_rate',
+      'sample',
+      'prior_source',
+    ];
+    for (const k of keys) expect(assertsProhibitedClaim(k)).toBe(false);
+  });
+
+  it('the names that were rejected WOULD be caught, proving the rule bites', () => {
+    for (const k of ['ai_accuracy', 'classification_correctness', 'model_reliability']) {
+      expect(assertsProhibitedClaim(k)).toBe(true);
+    }
+  });
+
+  it('neutral correction vocabulary passes the rule', () => {
+    for (const label of [
+      'Human classification corrections',
+      'Correction events',
+      'Tickets corrected',
+      'Category changes',
+      'Severity changes',
+      'Severity overrides',
+      'Prior classification source',
+    ]) {
+      expect(assertsProhibitedClaim(label)).toBe(false);
+    }
   });
 });

@@ -69,7 +69,7 @@ const GovernanceQuery = z.object({
 });
 
 /** Sections in the governance response, for the structured log. */
-const SECTION_COUNT = 14;
+const SECTION_COUNT = 15;
 
 /**
  * The projection is a WHITELIST, not `SELECT *`.
@@ -337,6 +337,10 @@ export async function aiOpsRoutes(app: FastifyInstance): Promise<void> {
           headline: report.population.headline,
           replays: report.population.replays,
           identity_holds: report.population.identity_holds,
+          // Phase 21. Counts only, like every other field here — never a
+          // category, a severity, a ticket id or a reviewer.
+          correction_events: report.corrections.events,
+          correction_tickets: report.corrections.tickets,
           sections_returned: SECTION_COUNT,
           total_ms: Date.now() - started,
           governance_version: report.meta.governance_version,

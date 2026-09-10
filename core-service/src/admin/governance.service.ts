@@ -3,6 +3,7 @@ import {
   CONFIDENCE_BUCKET_COUNT,
   CONFIDENCE_DISCLAIMER,
   COPILOT_DISCLAIMER,
+  CORRECTION_DISCLAIMER,
   DEFAULT_GOVERNANCE_WINDOW_DAYS,
   FAILURE_CATEGORY_LABEL,
   GOVERNANCE_FEATURES,
@@ -13,12 +14,15 @@ import {
   OPERATIONAL_COUNTS_DISCLAIMER,
   confidenceBucketLabel,
   failureCategoryOf,
+  sampleStateOf,
   AppError,
 } from '@iris/shared/types';
-import type { GovernanceResponse, Percentiles } from '@iris/shared/types';
+import type { GovernanceResponse, Percentiles, SampleState } from '@iris/shared/types';
 import type { Tx } from '../db/with-scope.js';
 import {
+  EMPTY_CORRECTION_METRICS,
   fetchCopilotMetrics,
+  fetchCorrectionMetrics,
   fetchGovernanceMetrics,
   type GovernanceQueryParams,
 } from './governance.repo.js';
@@ -141,6 +145,19 @@ export async function buildGovernanceReport(
   const started = Date.now();
   const m = await fetchGovernanceMetrics(tx, req);
   const c = await fetchCopilotMetrics(tx, req);
+
+  /**
+   * Phase 21. Corrections exist for classification and nothing else, so a
+   * filter naming another feature makes this panel INAPPLICABLE rather than
+   * empty. The query is skipped entirely — running it and then zeroing the
+   * result would spend a round trip to produce a number the response is about
+   * to disown.
+   */
+  const correctionsApply = req.feature === null || req.feature === 'classification';
+  const r = correctionsApply
+    ? await fetchCorrectionMetrics(tx, req)
+    : EMPTY_CORRECTION_METRICS;
+
   const queryMs = Date.now() - started;
 
   // ── The identity. COMPUTED, never assumed.
@@ -166,6 +183,32 @@ export async function buildGovernanceReport(
   const featuresWithoutConfidence = m.by_feature
     .filter((f) => f.with_confidence === 0)
     .map((f) => f.feature);
+
+  /**
+   * Phase 21 — the ONLY rate this panel publishes, and it is deliberately not
+   * about the AI.
+   *
+   * NUMERATOR    corrections where the reviewer stored a severity the priority
+   *              engine did not derive.
+   * DENOMINATOR  corrections where the engine RAN at all.
+   *
+   * ⚠️ THE DENOMINATOR IS NOT `events`. A correction on a ticket with no stored
+   * AI factors carries `reason: 'no_ai_factors'` and no derived severity: there
+   * was nothing to override, so it belongs on neither side. Dividing by every
+   * correction would shrink the share by however many such tickets exist, which
+   * is a property of the corpus rather than of reviewers.
+   *
+   * The numerator is a strict subset of the denominator, both drawn from the
+   * same rows in the same window — which is exactly what an AI correction rate
+   * could not offer, and why one is not published. See GOVERNANCE_UNMEASURABLE.
+   */
+  const overrideSample: SampleState = correctionsApply
+    ? sampleStateOf(r.override_eligible)
+    : 'none';
+  const severityOverrideRate =
+    overrideSample === 'sufficient'
+      ? Math.round((r.severity_overrides / r.override_eligible) * 10_000) / 10_000
+      : null;
 
   const response: GovernanceResponse = {
     window: { from: req.from.toISOString(), to: req.to.toISOString(), days: req.days },
@@ -249,6 +292,23 @@ export async function buildGovernanceReport(
       inventory: c.inventory,
     },
 
+    corrections: {
+      source: 'audit_event',
+      population: correctionsApply ? 'corrections' : 'corrections+filtered_out',
+      applies_to_filter: correctionsApply,
+      events: r.events,
+      tickets: r.tickets,
+      tickets_corrected_more_than_once: r.tickets_corrected_more_than_once,
+      events_without_ticket: r.events_without_ticket,
+      category_changes: r.category_changes,
+      severity_changes: r.severity_changes,
+      severity_overrides: r.severity_overrides,
+      override_eligible: r.override_eligible,
+      severity_override_rate: severityOverrideRate,
+      sample: overrideSample,
+      prior_source: r.prior_source,
+    },
+
     replays: { population: 'replay', n: m.replay_n, rows: m.replays },
 
     fallback: { population: 'headline', occurrences: m.executions.fallback },
@@ -268,6 +328,13 @@ export async function buildGovernanceReport(
       copilotInvocations: c.invocations,
       copilotTimed: c.total_ms.n,
       identityHolds,
+      correctionsApply,
+      correctionEvents: r.events,
+      correctionTickets: r.tickets,
+      correctionRepeats: r.tickets_corrected_more_than_once,
+      correctionsWithoutTicket: r.events_without_ticket,
+      overrideEligible: r.override_eligible,
+      overrideSample,
     }),
     unmeasurable: GOVERNANCE_UNMEASURABLE,
     meta: {
@@ -297,6 +364,13 @@ interface CaveatInput {
   copilotInvocations: number;
   copilotTimed: number;
   identityHolds: boolean;
+  correctionsApply: boolean;
+  correctionEvents: number;
+  correctionTickets: number;
+  correctionRepeats: number;
+  correctionsWithoutTicket: number;
+  overrideEligible: number;
+  overrideSample: SampleState;
 }
 
 /**
@@ -313,6 +387,16 @@ function buildCaveats(i: CaveatInput): string[] {
         'as unverified and report this — it means the population layers disagree.',
     );
   }
+
+  /**
+   * ⚠️ CORRECTION CAVEATS ARE EMITTED BEFORE THE EMPTY-EXECUTION RETURN BELOW.
+   *
+   * A window can hold corrections and no executions at all — a reviewer
+   * correcting last month's tickets today produces exactly that. Putting these
+   * after the early return would silently drop every correction caveat from the
+   * one window where the panel is the only thing on the page.
+   */
+  out.push(...correctionCaveats(i));
 
   if (i.headline === 0) {
     out.push('No AI executions in this window, so there is nothing to report.');
@@ -392,6 +476,82 @@ function buildCaveats(i: CaveatInput): string[] {
           'invocations — the earlier ones were recorded before timings were captured.',
       );
     }
+  }
+
+  return out;
+}
+
+/**
+ * Phase 21 — what the correction counts do and do not say.
+ *
+ * ⚠️ EVERY SENTENCE HERE IS NEUTRAL BY CONSTRUCTION. A correction is a human
+ * decision, not a verdict on the model, and copy that drifted into "the AI got
+ * N wrong" would assert something the audit trail cannot support.
+ */
+function correctionCaveats(i: CaveatInput): string[] {
+  const out: string[] = [];
+
+  if (!i.correctionsApply) {
+    out.push(
+      'Human classification corrections are not reported under this feature filter. ' +
+        'Corrections exist for classification only, so the panel is withheld rather ' +
+        'than shown as zero.',
+    );
+    return out;
+  }
+
+  out.push(CORRECTION_DISCLAIMER);
+
+  if (i.correctionEvents === 0) {
+    out.push(
+      'No classification corrections were recorded in this window. That is a count ' +
+        'of zero events, not a finding about the AI.',
+    );
+    return out;
+  }
+
+  if (i.correctionEvents !== i.correctionTickets) {
+    out.push(
+      `${i.correctionEvents} corrections were made across ${i.correctionTickets} ` +
+        `ticket${i.correctionTickets === 1 ? '' : 's'}; ` +
+        `${i.correctionRepeats} ticket${i.correctionRepeats === 1 ? ' was' : 's were'} ` +
+        'corrected more than once. Correction counts and ticket counts are never ' +
+        'interchangeable.',
+    );
+  }
+
+  out.push(
+    'One correction can change both the category and the severity, so those two ' +
+      'counts overlap and do not sum to the number of corrections.',
+  );
+
+  if (i.overrideSample === 'none') {
+    out.push(
+      'No correction in this window had a derived severity to override — the ' +
+        'priority engine needs stored AI factors to run — so no override share ' +
+        'can be formed.',
+    );
+  } else if (i.overrideSample === 'insufficient') {
+    out.push(
+      `The severity override share is withheld: ${i.overrideEligible} eligible ` +
+        `correction${i.overrideEligible === 1 ? '' : 's'} is below the ` +
+        `${MIN_SAMPLE_FOR_RATE} needed for a percentage to be worth reading. ` +
+        'The count is shown instead.',
+    );
+  } else {
+    out.push(
+      'The severity override share compares a reviewer against the deterministic ' +
+        'priority engine, not against the AI. Its denominator counts only ' +
+        'corrections where that engine produced a severity.',
+    );
+  }
+
+  if (i.correctionsWithoutTicket > 0) {
+    out.push(
+      `${i.correctionsWithoutTicket} correction event${i.correctionsWithoutTicket === 1 ? ' carries' : 's carry'} ` +
+        'no ticket reference, so the ticket count above is lower than the events ' +
+        'they belong to. Report this — every correction should name its ticket.',
+    );
   }
 
   return out;

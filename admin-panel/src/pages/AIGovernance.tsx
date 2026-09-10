@@ -12,10 +12,18 @@ import { Card, Empty, PageFooter, Spinner } from '../components/ui';
  *
  * Every figure here is an operational count over a stated population. None of
  * them says whether the AI was right, because nothing in IRIS knows that: there
- * is no labelled ground truth and no workflow through which a human corrects a
- * classification. A page that showed "93.6%" without saying what the 93.6% is
- * would be read as an accuracy score within a day, so the population arithmetic
- * comes FIRST, above every metric, and each panel names its own denominator.
+ * is no labelled ground truth. A page that showed "93.6%" without saying what
+ * the 93.6% is would be read as an accuracy score within a day, so the
+ * population arithmetic comes FIRST, above every metric, and each panel names
+ * its own denominator.
+ *
+ * ⚠️ PHASE 21 ADDED CORRECTIONS, AND THEY ARE STILL NOT AN ACCURACY SCORE.
+ * Phase 20 gave IRIS a workflow through which an authorized human corrects a
+ * classification, so corrections can now be counted — but a correction records
+ * a human decision, not a verdict on the model, and the classification it
+ * replaced may fall outside the window entirely. The panel therefore publishes
+ * counts and one share measured against the deterministic priority engine, and
+ * no share measured against the AI.
  *
  * ⚠️ THE VOCABULARY RULE. Terms that ASSERT a property the data cannot support
  * — accuracy, precision, calibrated, reliability, quality score — may not appear
@@ -422,7 +430,10 @@ export default function AIGovernance() {
             </Disclaimer>
           </Card>
 
-          {/* ── 10. Replays ──────────────────────────────────────────────── */}
+          {/* ── 10. Human classification corrections — Phase 21 ──────────── */}
+          <Corrections data={data} />
+
+          {/* ── 11. Replays ──────────────────────────────────────────────── */}
           <Card title="Replays — excluded from the figures above" style={{ marginTop: 14 }}>
             <div style={{ fontSize: 13 }}>
               <strong>{n(data.replays.n)}</strong> replayed execution{data.replays.n === 1 ? '' : 's'} in this window.
@@ -499,5 +510,162 @@ export default function AIGovernance() {
 
       <PageFooter />
     </>
+  );
+}
+
+/**
+ * Phase 21 — human classification corrections.
+ *
+ * ⚠️ FOUR STATES, AND THE POINT OF THE PANEL IS THAT THEY LOOK DIFFERENT.
+ *
+ *   not applicable  the feature filter names something other than classification
+ *   none            no corrections in the window
+ *   insufficient    corrections exist, too few eligible for a share
+ *   sufficient      the share is shown
+ *
+ * The first three render NO percentage glyph at all. A greyed-out "0%" would be
+ * read as a measured zero within a day, and a measured zero is precisely what
+ * this panel does not have. The same reasoning is why the not-applicable state
+ * withholds the counts instead of showing zeros under a Summary filter.
+ *
+ * ⚠️ THE COPY IS INLINE, NOT IMPORTED FROM SHARED TYPES, and that is forced
+ * rather than chosen. A VALUE import from `@iris/shared/types` drags `ids.ts`
+ * and `crypto.ts` — both `node:crypto` — into the browser bundle and the Vite
+ * build fails outright. Every other panel on this page writes its prose inline
+ * for the same reason; the canonical sentence still reaches the reader through
+ * the generated caveats, which are rendered above and are built from
+ * CORRECTION_DISCLAIMER on the server.
+ *
+ * ⚠️ NOTHING FROM THE AUDIT PAYLOAD IS RENDERED. No category or severity value,
+ * no ticket id, no reviewer, no customer text — only counts and the prior
+ * classification source, which is a fixed vocabulary rather than tenant data.
+ */
+function Corrections({ data }: { data: GovernanceResponse }) {
+  const c = data.corrections;
+  const title = 'Human classification corrections';
+
+  if (!c.applies_to_filter) {
+    return (
+      <Card title={title} style={{ marginTop: 14 }}>
+        <div style={{ fontSize: 13 }}>
+          Not reported under this feature filter — corrections exist for classification only.
+        </div>
+        <Disclaimer>
+          The counts are withheld rather than shown as zero. A zero here would read as
+          &ldquo;no corrections happened&rdquo;, which is a different statement from
+          &ldquo;this filter does not measure corrections&rdquo;. Choose Classification, or
+          all governed features, to see them.
+        </Disclaimer>
+      </Card>
+    );
+  }
+
+  if (c.events === 0) {
+    return (
+      <Card title={title} style={{ marginTop: 14 }}>
+        <div style={{ fontSize: 13 }}>
+          No classification corrections were recorded in this window.
+        </div>
+        <Denominator population={c.population} count={0} />
+        <Disclaimer>
+          A correction records that an authorized human changed the classification. It does
+          not establish that the AI was wrong. This is a count of zero events, not a finding
+          about the AI. These counts come from the audit trail and are never added to the
+          execution counts above.
+        </Disclaimer>
+      </Card>
+    );
+  }
+
+  const plural = (v: number, one: string, many: string) => (v === 1 ? one : many);
+
+  return (
+    <Card title={title} style={{ marginTop: 14 }}>
+      <div className="cards">
+        <Figure value={n(c.events)} label="Correction events" sub="one per human decision" />
+        <Figure
+          value={n(c.tickets)}
+          label="Tickets corrected"
+          sub={
+            c.tickets_corrected_more_than_once > 0
+              ? `${n(c.tickets_corrected_more_than_once)} corrected more than once`
+              : 'each corrected once'
+          }
+        />
+        <Figure value={n(c.category_changes)} label="Category changes" sub="events, not tickets" />
+        <Figure value={n(c.severity_changes)} label="Severity changes" sub="events, not tickets" />
+      </div>
+      <Denominator population={c.population} count={c.events} />
+
+      {/* ── Severity overrides. The one share this panel publishes. ─────── */}
+      <div style={{ marginTop: 14, fontSize: 13 }}>
+        <strong>{n(c.severity_overrides)}</strong>{' '}
+        severity {plural(c.severity_overrides, 'override', 'overrides')} — a reviewer stored a
+        severity the priority engine did not derive
+        {c.sample === 'sufficient' && c.severity_override_rate !== null ? (
+          <>
+            {' '}
+            · <strong>{(c.severity_override_rate * 100).toFixed(1)}%</strong> of{' '}
+            {n(c.override_eligible)} eligible{' '}
+            {plural(c.override_eligible, 'correction', 'corrections')}
+          </>
+        ) : null}
+      </div>
+
+      {c.sample === 'insufficient' ? (
+        <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 4 }}>
+          Share withheld — only {n(c.override_eligible)} eligible{' '}
+          {plural(c.override_eligible, 'correction', 'corrections')}. The count above is shown
+          instead; the caveats say how many a share needs.
+        </div>
+      ) : null}
+
+      {c.sample === 'none' ? (
+        <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 4 }}>
+          No share can be formed — no correction in this window had a derived severity to
+          override, which needs stored AI factors for the engine to run.
+        </div>
+      ) : null}
+
+      <Denominator population="corrections+engine_ran" count={c.override_eligible} />
+
+      {/* ── Prior classification source ─────────────────────────────────── */}
+      {c.prior_source.length > 0 ? (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginBottom: 8 }}>
+            Prior classification source
+          </div>
+          <Bars rows={c.prior_source} max={Math.max(1, ...c.prior_source.map((s) => s.n))} />
+        </div>
+      ) : null}
+
+      {c.events_without_ticket > 0 ? (
+        <div style={{ fontSize: 11.5, color: 'var(--danger, #b91c1c)', marginTop: 10 }}>
+          {n(c.events_without_ticket)} correction{' '}
+          {plural(c.events_without_ticket, 'event carries', 'events carry')} no ticket
+          reference, so the ticket count is lower than the events behind it. Please report this.
+        </div>
+      ) : null}
+
+      <Disclaimer>
+        A correction records that an authorized human changed the classification. It does not
+        establish that the AI was wrong. A reviewer may be applying product knowledge the model
+        never had, or reclassifying after the customer clarified; the audit trail records the
+        change, not the reason for it. These counts come from the audit trail and are never added to
+        the execution counts above.
+        {c.events !== c.tickets ? (
+          <>
+            {' '}
+            {n(c.events)} corrections were made across {n(c.tickets)}{' '}
+            {plural(c.tickets, 'ticket', 'tickets')}, so correction counts and ticket counts
+            are not interchangeable.
+          </>
+        ) : null}{' '}
+        A single correction can change both category and severity, so those two counts overlap.
+        The severity override share compares a reviewer against the deterministic priority
+        engine, never against the AI — no share of corrections against AI output is published,
+        because the classification a correction replaced may fall outside this window.
+      </Disclaimer>
+    </Card>
   );
 }

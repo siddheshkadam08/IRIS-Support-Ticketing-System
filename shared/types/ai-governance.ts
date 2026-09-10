@@ -100,8 +100,18 @@ export function isGovernanceExecution(row: {
  *     the provider's `usage` object is discarded. Cost is not derivable and
  *     must not be estimated.
  *   - ACCURACY. There is no labelled ground truth. A classification that was
- *     never corrected is not a classification that was right; nobody can
- *     correct one, because no endpoint changes a ticket's category.
+ *     never corrected is not a classification that was right.
+ *
+ *     ⚠️ PHASE 20 CHANGED HALF OF THIS SENTENCE AND NOT THE OTHER HALF.
+ *     Until Phase 20 no endpoint could change a ticket's category, so no
+ *     correction existed to count. One does now — `ticket.classification_-
+ *     corrected` — and Phase 21 counts it. What is still absent is the
+ *     DENOMINATOR: a correction and the classification it replaced fall in
+ *     different windows, and a corrected ticket's `classification_source`
+ *     becomes 'human', so it leaves any denominator built from the ticket
+ *     table exactly as the numerator grows. `human_correction_rate` therefore
+ *     stays on this list. Counting corrections is measurable; expressing them
+ *     as a rate against AI output is not.
  *   - CONFIDENCE AS CORRECTNESS. `confidence` is the model's own uncalibrated
  *     signal. It is comparable across executions of the same feature and says
  *     nothing about whether an answer was correct.
@@ -176,6 +186,32 @@ export type MetricPopulation = string;
  * then have to be kept in step with it.
  */
 export const MIN_SAMPLE_FOR_RATE = 30;
+
+/**
+ * How much evidence a rate stands on — Phase 21.
+ *
+ * ⚠️ `rate_suppressed: boolean` CANNOT SAY WHICH KIND OF NOTHING THIS IS, and
+ * the difference matters more than the rate does. "No corrections happened" and
+ * "corrections happened but too few to express as a share" are different facts
+ * about the platform, and collapsing them into one flag pushes the reader
+ * toward the wrong one — usually toward reading an absent percentage as zero.
+ *
+ *   none          0 eligible observations. There is nothing to divide.
+ *   insufficient  1..MIN_SAMPLE_FOR_RATE-1. A share exists but is not worth
+ *                 reading; the count is published instead.
+ *   sufficient    >= MIN_SAMPLE_FOR_RATE. The share is published.
+ *
+ * The rate is `null` in BOTH withheld states and never 0. A zero percent is a
+ * measurement; an absent percentage is an admission.
+ */
+export const SAMPLE_STATES = ['none', 'insufficient', 'sufficient'] as const;
+export type SampleState = (typeof SAMPLE_STATES)[number];
+
+/** The single place the three states are decided, so no caller can disagree. */
+export function sampleStateOf(denominator: number): SampleState {
+  if (denominator <= 0) return 'none';
+  return denominator < MIN_SAMPLE_FOR_RATE ? 'insufficient' : 'sufficient';
+}
 
 /** Maximum queryable span. A year plus a day, so a leap year still fits. */
 export const MAX_GOVERNANCE_WINDOW_DAYS = 366;
@@ -286,6 +322,19 @@ export const NO_ACCURACY_DISCLAIMER =
 
 export const COPILOT_DISCLAIMER =
   'Copilot drafts are ephemeral by design. What an agent did with a draft is not recorded.';
+
+/**
+ * ⚠️ THE SENTENCE THAT MUST ACCOMPANY EVERY CORRECTION FIGURE — Phase 21.
+ *
+ * A correction is evidence that a human made a decision. It is NOT evidence
+ * that the AI was wrong: a reviewer may be applying product knowledge the model
+ * never had, reclassifying after the customer clarified, or simply disagreeing.
+ * The audit trail records the change, not its justification, so a count here
+ * labelled an error rate would assert something nobody measured.
+ */
+export const CORRECTION_DISCLAIMER =
+  'A correction records that an authorized human changed the classification. ' +
+  'It does not establish that the AI was wrong.';
 
 // ── Vocabulary policy ────────────────────────────────────────────────────
 
@@ -483,6 +532,47 @@ export interface GovernanceResponse {
     generation_ms: Percentiles;
     retrieval_ms: Percentiles;
     inventory: Array<{ model: string | null; prompt_version: string | null; n: number }>;
+  };
+
+  /**
+   * Phase 21 — human classification corrections.
+   *
+   * ⚠️ A THIRD SOURCE, A THIRD DENOMINATOR. Like `copilot` this comes from
+   * `audit_event` and stands outside the L1–L3' execution pipeline entirely.
+   * A correction is not an execution and must never be added to one.
+   *
+   * ⚠️ NEITHER IS IT AN ERROR COUNT. See CORRECTION_DISCLAIMER. The only rate
+   * published here compares a human's stored severity against IRIS's own
+   * deterministic engine, never against the AI.
+   */
+  corrections: {
+    source: 'audit_event';
+    population: MetricPopulation;
+    /**
+     * False when the feature filter names something other than classification.
+     * Corrections exist only for classification, so under any other filter the
+     * counts below are NOT REPORTED rather than reported as zero — a zero would
+     * read as "no corrections happened", which is a different claim.
+     */
+    applies_to_filter: boolean;
+    /** Correction DECISIONS. One per audited correction, never one per field. */
+    events: number;
+    /** Distinct tickets behind those decisions. Always <= events. */
+    tickets: number;
+    tickets_corrected_more_than_once: number;
+    /** Defensive. Should be 0; a non-zero means `tickets` is undercounting. */
+    events_without_ticket: number;
+    category_changes: number;
+    severity_changes: number;
+    /** Reviewer stored a severity the priority engine did not derive. */
+    severity_overrides: number;
+    /** Corrections where the engine ran at all — the override denominator. */
+    override_eligible: number;
+    /** ⚠️ Null when withheld. NEVER 0 standing in for "not enough data". */
+    severity_override_rate: number | null;
+    sample: SampleState;
+    /** The classification source each correction replaced. Grouped, not enumerated. */
+    prior_source: CountRow[];
   };
 
   replays: {

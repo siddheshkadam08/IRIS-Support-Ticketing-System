@@ -381,7 +381,138 @@ export async function fetchCopilotMetrics(
   return rows[0]!;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 21 — Human classification corrections. A THIRD SOURCE.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Corrections write no `ai_execution` row — Phase 20 changes the ticket and
+ * writes one audit row, nothing else. So this stands beside the Copilot query,
+ * outside the L1–L3' pipeline, for the same reason: there is no execution to
+ * put in a population. A correction and an execution are not the same kind of
+ * thing and are never summed.
+ *
+ * ⚠️ `IS DISTINCT FROM`, NOT `<>`. An unclassified ticket has NULL category and
+ * NULL severity, and `NULL <> 'billing'` is NULL, not true — which would drop
+ * from `category_changes` exactly the corrections that set a value where none
+ * existed. Those are the most consequential corrections there are.
+ *
+ * ⚠️ `overridden_text = 'true'`, NOT a boolean cast. Same lesson the Copilot
+ * numeric guard already learned: these values come out of jsonb, and a single
+ * malformed audit row would abort the entire governance response with a cast
+ * error. A value that does not read as 'true' is simply not counted, and the
+ * loss is visible because `events` still includes the row.
+ *
+ * ⚠️ `prior_source` IS GROUPED, NOT ENUMERATED. A sixth classification source
+ * added later shows up here on its own instead of silently vanishing from a
+ * hardcoded list.
+ *
+ * The action and entity_type are compile-time literals; every request-derived
+ * value is a bind parameter, exactly as above.
+ */
+const CORRECTIONS_SQL = `
+WITH corrections AS MATERIALIZED (
+  SELECT a.entity_id, a.before, a.after
+    FROM audit_event a
+   WHERE a.action      = 'ticket.classification_corrected'
+     AND a.entity_type = 'ticket'
+     AND a.occurred_at >= $1
+     AND a.occurred_at <  $2
+     AND ($3::text IS NULL OR a.product_id = $3)
+),
+fields AS (
+  SELECT entity_id,
+         before->>'category'              AS before_category,
+         after ->>'category'              AS after_category,
+         before->>'severity'              AS before_severity,
+         after ->>'severity'              AS after_severity,
+         before->>'classification_source' AS prior_source,
+         after ->>'derived_severity'      AS derived_severity,
+         after ->>'severity_overridden'   AS overridden_text
+    FROM corrections
+)
+SELECT
+  (SELECT count(*)::int FROM fields) AS events,
+  (SELECT count(DISTINCT entity_id)::int
+     FROM fields
+    WHERE entity_id IS NOT NULL) AS tickets,
+  (SELECT count(*)::int
+     FROM (
+       SELECT entity_id
+         FROM fields
+        WHERE entity_id IS NOT NULL
+        GROUP BY entity_id
+       HAVING count(*) > 1
+     ) x) AS tickets_corrected_more_than_once,
+  (SELECT count(*)::int
+     FROM fields
+    WHERE entity_id IS NULL) AS events_without_ticket,
+  (SELECT count(*)::int
+     FROM fields
+    WHERE before_category IS DISTINCT FROM after_category) AS category_changes,
+  (SELECT count(*)::int
+     FROM fields
+    WHERE before_severity IS DISTINCT FROM after_severity) AS severity_changes,
+  (SELECT count(*)::int
+     FROM fields
+    WHERE overridden_text = 'true') AS severity_overrides,
+  (SELECT count(*)::int
+     FROM fields
+    WHERE derived_severity IS NOT NULL) AS override_eligible,
+  (SELECT COALESCE(
+      json_agg(
+        json_build_object('key', k, 'n', n)
+        ORDER BY n DESC
+      ),
+      '[]'::json
+    )
+     FROM (
+       SELECT COALESCE(prior_source, 'not recorded') AS k,
+              count(*)::int AS n
+         FROM fields
+        GROUP BY 1
+     ) x) AS prior_source
+`;
+
+export interface CorrectionMetricsRow {
+  events: number;
+  tickets: number;
+  tickets_corrected_more_than_once: number;
+  events_without_ticket: number;
+  category_changes: number;
+  severity_changes: number;
+  severity_overrides: number;
+  override_eligible: number;
+  prior_source: Array<{ key: string; n: number }>;
+}
+
+/** The zero row, for the case where the feature filter excludes classification. */
+export const EMPTY_CORRECTION_METRICS: CorrectionMetricsRow = {
+  events: 0,
+  tickets: 0,
+  tickets_corrected_more_than_once: 0,
+  events_without_ticket: 0,
+  category_changes: 0,
+  severity_changes: 0,
+  severity_overrides: 0,
+  override_eligible: 0,
+  prior_source: [],
+};
+
+export async function fetchCorrectionMetrics(
+  tx: Tx,
+  p: Pick<GovernanceQueryParams, 'from' | 'to' | 'productId'>,
+): Promise<CorrectionMetricsRow> {
+  const { rows } = await tx.query<CorrectionMetricsRow>(CORRECTIONS_SQL, [
+    p.from,
+    p.to,
+    p.productId,
+  ]);
+  return rows[0]!;
+}
+
 /** Exposed for the performance test, which runs EXPLAIN over the real pipeline. */
 export const GOVERNANCE_METRICS_SQL = METRICS_SQL;
+export const GOVERNANCE_CORRECTIONS_SQL = CORRECTIONS_SQL;
 export const GOVERNANCE_POPULATION_CTE = POPULATION_CTE;
 export const governanceQueryParams = params;
